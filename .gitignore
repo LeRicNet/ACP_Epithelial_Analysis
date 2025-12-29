@@ -1,0 +1,76 @@
+# ==============================================================================
+# .gitignore for ACP Epithelial Analysis
+# ==============================================================================
+
+# R/RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user
+
+# renv
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
+
+# Data files (too large for git)
+data/raw/*.rds
+data/raw/*.h5ad
+data/raw/*.h5
+data/processed/*.rds
+data/external/**/*.rds
+data/external/**/*.h5ad
+*.rds
+!config/*.rds
+
+# But keep directory structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+
+# Results (can be regenerated)
+results/objects/*.rds
+results/figures/**/*.pdf
+results/figures/**/*.png
+
+# But keep directory structure
+!results/objects/.gitkeep
+!results/figures/main/.gitkeep
+!results/figures/supplementary/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Compiled files
+*.o
+*.so
+*.dll
+
+# Large files
+*.zip
+*.tar.gz
+*.tar.bz2
+
+# Credentials (never commit these)
+.env
+*.pem
+*.key
+credentials.yaml

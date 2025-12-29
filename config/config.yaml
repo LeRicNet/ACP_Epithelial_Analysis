@@ -1,0 +1,391 @@
+# ==============================================================================
+# ACP Epithelial Differentiation Analysis - Configuration File
+# ==============================================================================
+# This file contains all file paths, gene signatures, and analysis parameters.
+# Edit this file to customize the analysis without modifying R code.
+# ==============================================================================
+
+# Project metadata
+project:
+  name: "ACP Epithelial Differentiation Analysis"
+  version: "1.0.0"
+  author: "Your Name"
+  date_created: "2025-01-01"
+  description: >
+    Analysis of epithelial differentiation trajectories in adamantinomatous
+    craniopharyngioma using spatial transcriptomics and snRNA-seq validation.
+
+# ==============================================================================
+# FILE PATHS
+# ==============================================================================
+
+paths:
+  # Input data
+  spatial_object: "data/raw/spatial-object.rds"
+  spatial_object_with_subtypes: "data/raw/spatial-object-with-epithelial-subtypes.rds"
+  snrnaseq_processed: "data/external/GSE215932/GSE215932_snRNA_processed.rds"
+  bulk_rnaseq: "data/external/OpenPBTA/bulk_rnaseq.rds"
+  
+  # Processed data outputs
+  processed_spatial: "data/processed/spatial_processed.rds"
+  classification_results: "data/processed/classification_results.rds"
+  trajectory_results: "data/processed/trajectory_results.rds"
+  
+  # Results outputs
+  tables_dir: "results/tables"
+  figures_main_dir: "results/figures/main"
+  figures_supp_dir: "results/figures/supplementary"
+  objects_dir: "results/objects"
+
+# ==============================================================================
+# GENE SIGNATURES
+# ==============================================================================
+
+signatures:
+  # Core epithelial subtype signatures (for module scoring)
+  epithelial_subtypes:
+    Basal_like:
+      - KRT5
+      - KRT14
+      - KRT15
+      - TP63
+      - KRT6A
+      - KRT6B
+      - ITGA6
+      - ITGB4
+      - COL17A1
+      - LAMB3
+      - LAMC2
+    
+    Intermediate:
+      - KRT8
+      - KRT18
+      - KRT19
+      - KRT7
+      - EPCAM
+      - CDH1
+      - CLDN3
+      - CLDN4
+      - CLDN7
+      - TJP1
+      - OCLN
+    
+    Specialized:
+      - KRT17
+      - KRT23
+      - KRT10
+      - KRT1
+      - IVL
+      - FLG
+      - SPRR1A
+      - SPRR1B
+      - SPRR2A
+      - LOR
+    
+    Transit_Amplifying:
+      - MKI67
+      - TOP2A
+      - STMN1
+      - PCNA
+      - MCM2
+      - MCM5
+      - CDK1
+      - CCNB1
+      - CCNA2
+      - TYMS
+  
+  # Whorl/Wnt pathway signature
+  Whorl_Wnt:
+    - SHH
+    - DKK4
+    - AXIN2
+    - LEF1
+    - WNT5A
+    - BMP4
+    - FGF4
+    - CTNNB1
+    - NOTCH1
+    - HES1
+    - JAG1
+  
+  # Senescence signature
+  Senescence:
+    - CDKN1A
+    - CDKN2A
+    - TP53
+    - RB1
+    - GLB1
+    - SERPINE1
+    - IGFBP3
+    - IGFBP7
+    - LMNB1
+  
+  # SASP (Senescence-Associated Secretory Phenotype)
+  SASP:
+    - IL6
+    - IL1A
+    - IL1B
+    - CXCL1
+    - CXCL8
+    - CCL2
+    - CCL20
+    - MMP1
+    - MMP3
+    - MMP9
+    - MMP10
+    - SERPINE1
+    - IGFBP3
+    - IGFBP7
+  
+  # CD44-SPP1 axis
+  CD44_SPP1:
+    - CD44
+    - SPP1
+    - ITGAV
+    - ITGB1
+    - ITGB3
+    - ITGB5
+  
+  # ECM signatures
+  Collagen:
+    - COL1A1
+    - COL1A2
+    - COL3A1
+    - COL4A1
+    - COL5A1
+    - COL6A1
+    - COL6A2
+    - COL6A3
+    - COL11A1
+  
+  Matricellular:
+    - POSTN
+    - TNC
+    - THBS1
+    - THBS2
+    - SPARC
+    - CTGF
+    - CYR61
+    - FN1
+    - VTN
+  
+  ECM_Remodeling:
+    - MMP2
+    - MMP9
+    - MMP14
+    - TIMP1
+    - TIMP2
+    - TIMP3
+    - LOX
+    - LOXL1
+    - LOXL2
+  
+  Basement_Membrane:
+    - LAMA3
+    - LAMA5
+    - LAMB1
+    - LAMB2
+    - LAMB3
+    - LAMC1
+    - LAMC2
+    - NID1
+    - HSPG2
+
+# Key individual markers for visualization
+markers:
+  keratins:
+    - KRT5
+    - KRT8
+    - KRT14
+    - KRT17
+    - KRT18
+    - KRT19
+    - KRT23
+  
+  proliferation:
+    - MKI67
+    - TOP2A
+    - PCNA
+    - STMN1
+  
+  whorl:
+    - SHH
+    - DKK4
+    - CTNNB1
+    - LEF1
+  
+  senescence:
+    - CDKN1A
+    - CDKN2A
+    - GLB1
+  
+  ecm:
+    - COL1A1
+    - COL1A2
+    - POSTN
+    - TNC
+  
+  adhesion:
+    - CD44
+    - SPP1
+    - EPCAM
+
+# ==============================================================================
+# CLASSIFICATION PARAMETERS
+# ==============================================================================
+
+classification:
+  # Module score classification settings
+  method: "module_score"  # Options: "module_score", "binary_threshold", "hybrid"
+  
+  # Minimum score threshold for assignment (cells below this = Unassigned)
+  min_score_threshold: 0.1
+  
+  # For hybrid classification: controls relative importance
+  hybrid_weights:
+    module_score: 0.7
+    binary_threshold: 0.3
+  
+  # Binary threshold settings (for comparison/hybrid)
+  binary_thresholds:
+    scaled_data_threshold: 1.0  # z-score threshold
+  
+  # Proliferation-based Transit-Amplifying identification
+  transit_amplifying:
+    # Cells with proliferation score above this are considered TA
+    proliferation_threshold: 0.15
+    # Additionally require S or G2M phase
+    require_cycling: true
+    # Override other classifications if proliferation is high
+    override_on_high_proliferation: true
+    override_threshold: 0.3
+
+# ==============================================================================
+# TRAJECTORY ANALYSIS PARAMETERS
+# ==============================================================================
+
+trajectory:
+  # Monocle3 settings
+  monocle3:
+    # Root cell selection
+    root_subtype: "Basal-like"
+    root_selection_method: "all_cells"  # Options: "all_cells", "random_sample", "graph_node"
+    n_root_cells: 50  # If using random_sample
+    
+    # Graph learning
+    use_partition: true
+    close_loop: false
+    
+    # Dimensionality reduction
+    n_pcs: 30
+    umap_dims: 30
+  
+  # Per-sample analysis settings
+  per_sample:
+    min_cells_per_sample: 50
+    min_cells_per_subtype: 5
+  
+  # Statistical settings
+  statistics:
+    n_permutations: 1000
+    alpha: 0.05
+    effect_size_method: "cliff_delta"
+
+# ==============================================================================
+# VALIDATION ANALYSIS PARAMETERS
+# ==============================================================================
+
+validation:
+  # snRNA-seq (GSE215932) settings
+  snrnaseq:
+    # Mapping from Xu et al. clusters to our nomenclature
+    cluster_mapping:
+      E_C1_PE: "Basal-like"
+      E_C2_WC: "Specialized-Wnt"
+      E_C3_KC: "Intermediate"
+      E_C4_RHCG: "Specialized-Senescent"
+      E_C5_Prolif: "Transit-Amplifying"
+  
+  # Bulk RNA-seq deconvolution settings
+  bulk_deconvolution:
+    method: "MuSiC"  # Options: "MuSiC", "BisqueRNA", "CIBERSORT"
+
+# ==============================================================================
+# VISUALIZATION PARAMETERS
+# ==============================================================================
+
+visualization:
+  # Color palettes
+  colors:
+    epithelial_subtypes:
+      Basal-like: "#E41A1C"
+      Transit-Amplifying: "#FF7F00"
+      Intermediate: "#4DAF4A"
+      Specialized: "#377EB8"
+      Basal-Intermediate: "#984EA3"
+      Intermediate-Specialized: "#A65628"
+      Unknown: "#999999"
+      Non-epithelial: "#CCCCCC"
+    
+    cell_cycle:
+      G1: "#F8766D"
+      S: "#00BA38"
+      G2M: "#619CFF"
+    
+    samples:
+      sampleA: "#1B9E77"
+      sampleB: "#D95F02"
+      sampleC: "#7570B3"
+      sampleD: "#E7298A"
+  
+  # Figure dimensions (inches)
+  figure_sizes:
+    single_panel:
+      width: 6
+      height: 5
+    double_panel:
+      width: 12
+      height: 5
+    multi_panel:
+      width: 14
+      height: 10
+    spatial_plot:
+      width: 8
+      height: 6
+  
+  # Plot settings
+  plot_settings:
+    point_size: 1.5
+    alpha: 0.7
+    dpi: 300
+    font_family: "Arial"
+    base_size: 12
+
+# ==============================================================================
+# REPRODUCIBILITY SETTINGS
+# ==============================================================================
+
+reproducibility:
+  seed: 42
+  n_cores: 4  # For parallel processing
+
+# ==============================================================================
+# OUTPUT FORMATS
+# ==============================================================================
+
+output:
+  # Table formats
+  tables:
+    format: "csv"  # Options: "csv", "tsv", "xlsx"
+    include_excel_workbook: true
+  
+  # Figure formats
+  figures:
+    formats:
+      - "pdf"
+      - "png"
+    png_dpi: 300
+  
+  # R objects
+  objects:
+    compress: true
