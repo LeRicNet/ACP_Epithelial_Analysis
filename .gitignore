@@ -19,12 +19,14 @@ renv/sandbox/
 renv/staging/
 
 # Data files (too large for git)
-data/raw/*.rds
-data/raw/*.h5ad
-data/raw/*.h5
-data/processed/*.rds
-data/external/**/*.rds
-data/external/**/*.h5ad
+data
+results
+# data/raw/*.rds
+# data/raw/*.h5ad
+# data/raw/*.h5
+# data/processed/*.rds
+# data/external/**/*.rds
+# data/external/**/*.h5ad
 *.rds
 !config/*.rds
 

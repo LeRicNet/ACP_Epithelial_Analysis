@@ -9,8 +9,8 @@
 project:
   name: "ACP Epithelial Differentiation Analysis"
   version: "1.0.0"
-  author: "Your Name"
-  date_created: "2025-01-01"
+  author: "Eric Prince"
+  date_created: "2025-12-29"
   description: >
     Analysis of epithelial differentiation trajectories in adamantinomatous
     craniopharyngioma using spatial transcriptomics and snRNA-seq validation.
@@ -25,12 +25,12 @@ paths:
   spatial_object_with_subtypes: "data/raw/spatial-object-with-epithelial-subtypes.rds"
   snrnaseq_processed: "data/external/GSE215932/GSE215932_snRNA_processed.rds"
   bulk_rnaseq: "data/external/OpenPBTA/bulk_rnaseq.rds"
-  
+
   # Processed data outputs
   processed_spatial: "data/processed/spatial_processed.rds"
   classification_results: "data/processed/classification_results.rds"
   trajectory_results: "data/processed/trajectory_results.rds"
-  
+
   # Results outputs
   tables_dir: "results/tables"
   figures_main_dir: "results/figures/main"
@@ -56,7 +56,7 @@ signatures:
       - COL17A1
       - LAMB3
       - LAMC2
-    
+
     Intermediate:
       - KRT8
       - KRT18
@@ -69,7 +69,7 @@ signatures:
       - CLDN7
       - TJP1
       - OCLN
-    
+
     Specialized:
       - KRT17
       - KRT23
@@ -81,7 +81,7 @@ signatures:
       - SPRR1B
       - SPRR2A
       - LOR
-    
+
     Transit_Amplifying:
       - MKI67
       - TOP2A
@@ -93,7 +93,7 @@ signatures:
       - CCNB1
       - CCNA2
       - TYMS
-  
+
   # Whorl/Wnt pathway signature
   Whorl_Wnt:
     - SHH
@@ -107,7 +107,7 @@ signatures:
     - NOTCH1
     - HES1
     - JAG1
-  
+
   # Senescence signature
   Senescence:
     - CDKN1A
@@ -119,7 +119,7 @@ signatures:
     - IGFBP3
     - IGFBP7
     - LMNB1
-  
+
   # SASP (Senescence-Associated Secretory Phenotype)
   SASP:
     - IL6
@@ -136,7 +136,7 @@ signatures:
     - SERPINE1
     - IGFBP3
     - IGFBP7
-  
+
   # CD44-SPP1 axis
   CD44_SPP1:
     - CD44
@@ -145,7 +145,7 @@ signatures:
     - ITGB1
     - ITGB3
     - ITGB5
-  
+
   # ECM signatures
   Collagen:
     - COL1A1
@@ -157,7 +157,7 @@ signatures:
     - COL6A2
     - COL6A3
     - COL11A1
-  
+
   Matricellular:
     - POSTN
     - TNC
@@ -168,7 +168,7 @@ signatures:
     - CYR61
     - FN1
     - VTN
-  
+
   ECM_Remodeling:
     - MMP2
     - MMP9
@@ -179,7 +179,7 @@ signatures:
     - LOX
     - LOXL1
     - LOXL2
-  
+
   Basement_Membrane:
     - LAMA3
     - LAMA5
@@ -201,30 +201,30 @@ markers:
     - KRT18
     - KRT19
     - KRT23
-  
+
   proliferation:
     - MKI67
     - TOP2A
     - PCNA
     - STMN1
-  
+
   whorl:
     - SHH
     - DKK4
     - CTNNB1
     - LEF1
-  
+
   senescence:
     - CDKN1A
     - CDKN2A
     - GLB1
-  
+
   ecm:
     - COL1A1
     - COL1A2
     - POSTN
     - TNC
-  
+
   adhesion:
     - CD44
     - SPP1
@@ -237,19 +237,19 @@ markers:
 classification:
   # Module score classification settings
   method: "module_score"  # Options: "module_score", "binary_threshold", "hybrid"
-  
+
   # Minimum score threshold for assignment (cells below this = Unassigned)
   min_score_threshold: 0.1
-  
+
   # For hybrid classification: controls relative importance
   hybrid_weights:
     module_score: 0.7
     binary_threshold: 0.3
-  
+
   # Binary threshold settings (for comparison/hybrid)
   binary_thresholds:
     scaled_data_threshold: 1.0  # z-score threshold
-  
+
   # Proliferation-based Transit-Amplifying identification
   transit_amplifying:
     # Cells with proliferation score above this are considered TA
@@ -271,20 +271,20 @@ trajectory:
     root_subtype: "Basal-like"
     root_selection_method: "all_cells"  # Options: "all_cells", "random_sample", "graph_node"
     n_root_cells: 50  # If using random_sample
-    
+
     # Graph learning
     use_partition: true
     close_loop: false
-    
+
     # Dimensionality reduction
     n_pcs: 30
     umap_dims: 30
-  
+
   # Per-sample analysis settings
   per_sample:
     min_cells_per_sample: 50
     min_cells_per_subtype: 5
-  
+
   # Statistical settings
   statistics:
     n_permutations: 1000
@@ -305,7 +305,7 @@ validation:
       E_C3_KC: "Intermediate"
       E_C4_RHCG: "Specialized-Senescent"
       E_C5_Prolif: "Transit-Amplifying"
-  
+
   # Bulk RNA-seq deconvolution settings
   bulk_deconvolution:
     method: "MuSiC"  # Options: "MuSiC", "BisqueRNA", "CIBERSORT"
@@ -326,18 +326,18 @@ visualization:
       Intermediate-Specialized: "#A65628"
       Unknown: "#999999"
       Non-epithelial: "#CCCCCC"
-    
+
     cell_cycle:
       G1: "#F8766D"
       S: "#00BA38"
       G2M: "#619CFF"
-    
+
     samples:
       sampleA: "#1B9E77"
       sampleB: "#D95F02"
       sampleC: "#7570B3"
       sampleD: "#E7298A"
-  
+
   # Figure dimensions (inches)
   figure_sizes:
     single_panel:
@@ -352,7 +352,7 @@ visualization:
     spatial_plot:
       width: 8
       height: 6
-  
+
   # Plot settings
   plot_settings:
     point_size: 1.5
@@ -378,14 +378,14 @@ output:
   tables:
     format: "csv"  # Options: "csv", "tsv", "xlsx"
     include_excel_workbook: true
-  
+
   # Figure formats
   figures:
     formats:
       - "pdf"
       - "png"
     png_dpi: 300
-  
+
   # R objects
   objects:
     compress: true
