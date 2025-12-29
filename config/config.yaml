@@ -265,31 +265,81 @@ classification:
 # ==============================================================================
 
 trajectory:
-  # Monocle3 settings
+  # Methods to use for trajectory inference
+  # Options: "monocle3", "slingshot", "diffusion"
+  methods:
+    - monocle3
+    - slingshot
+    - diffusion
+
+  # Monocle3-specific settings
   monocle3:
-    # Root cell selection
     root_subtype: "Basal-like"
     root_selection_method: "all_cells"  # Options: "all_cells", "random_sample", "graph_node"
     n_root_cells: 50  # If using random_sample
-
-    # Graph learning
     use_partition: true
     close_loop: false
-
-    # Dimensionality reduction
     n_pcs: 30
     umap_dims: 30
 
+  # Slingshot-specific settings
+  slingshot:
+    reduction: "umap"  # Which reduction to use
+    stretch: 2
+    extend: "n"
+
+  # Diffusion pseudotime settings
+  diffusion:
+    n_neighbors: 30
+    use_destiny: true  # Use destiny package if available
+
+  # Consensus settings
+  consensus:
+    # Minimum correlation to consider methods concordant
+    min_correlation: 0.5
+    # Flip reversed trajectories automatically
+    auto_flip: true
+
   # Per-sample analysis settings
   per_sample:
-    min_cells_per_sample: 50
-    min_cells_per_subtype: 5
+    enabled: true
+    min_cells_per_sample: 100
+    min_cells_per_subtype: 10
+
+  # Expected ordering for validation
+  expected_order:
+    - "Basal-like"
+    - "Transit-Amplifying"
+    - "Intermediate"
+    - "Specialized"
 
   # Statistical settings
   statistics:
     n_permutations: 1000
     alpha: 0.05
-    effect_size_method: "cliff_delta"
+
+# ==============================================================================
+# CELL CYCLE SCORING PARAMETERS
+# ==============================================================================
+
+cell_cycle:
+  # Methods to use for cell cycle scoring
+  # Options: "seurat", "module_score", "cyclone"
+  methods:
+    - seurat
+    - module_score
+    - cyclone
+
+  # Minimum genes required per phase (S and G2M)
+  min_genes: 5
+
+  # Score threshold for module_score method
+  score_threshold: 0.1
+
+  # Consensus determination
+  consensus:
+    min_agreement: 0.5
+    uncertain_label: "Uncertain"
 
 # ==============================================================================
 # VALIDATION ANALYSIS PARAMETERS
@@ -367,7 +417,7 @@ visualization:
 
 reproducibility:
   seed: 42
-  n_cores: 4  # For parallel processing
+  n_cores: 28  # For parallel processing
 
 # ==============================================================================
 # OUTPUT FORMATS

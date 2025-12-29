@@ -289,48 +289,48 @@ for (col in score_cols) {
 }
 
 # ==============================================================================
-# CELL CYCLE SCORING
+# CELL CYCLE SCORING (Multi-Method Consensus)
 # ==============================================================================
 
 message("\n========================================")
 message("Cell Cycle Scoring")
 message("========================================\n")
 
-# Check if cell cycle already scored
-if ("Phase" %in% colnames(seurat_obj@meta.data)) {
-  message("Cell cycle phase already present in metadata")
-  print(table(seurat_obj$Phase))
-} else {
-  message("Scoring cell cycle phases...")
+# Source the cell cycle scoring utility
+source("R/utils/cell_cycle_scoring.R")
 
-  # Use Seurat's built-in cell cycle genes
-  s_genes <- cc.genes.updated.2019$s.genes
-  g2m_genes <- cc.genes.updated.2019$g2m.genes
-
-  s_present <- intersect(s_genes, available_genes)
-  g2m_present <- intersect(g2m_genes, available_genes)
-
-  message(sprintf("  S phase genes: %d/%d present", length(s_present), length(s_genes)))
-  message(sprintf("  G2M phase genes: %d/%d present", length(g2m_present), length(g2m_genes)))
-
-  if (length(s_present) >= 5 && length(g2m_present) >= 5) {
-    tryCatch({
-      seurat_obj <- CellCycleScoring(
-        seurat_obj,
-        s.features = s_present,
-        g2m.features = g2m_present,
-        set.ident = FALSE
-      )
-      message("\nCell cycle distribution:")
-      print(table(seurat_obj$Phase))
-    }, error = function(e) {
-      warning(paste("Cell cycle scoring failed:", e$message))
-      seurat_obj$Phase <- "Unknown"
-    })
-  } else {
-    warning("Insufficient cell cycle genes - skipping scoring")
-    seurat_obj$Phase <- "Unknown"
+# Check if cell cycle already scored with consensus
+if ("cc_consensus" %in% colnames(seurat_obj@meta.data)) {
+  message("Cell cycle consensus already present in metadata")
+  message("\nConsensus phase distribution:")
+  print(table(seurat_obj$cc_consensus))
+  if ("cc_confidence" %in% colnames(seurat_obj@meta.data)) {
+    message(sprintf("Mean confidence: %.2f", mean(seurat_obj$cc_confidence)))
   }
+} else if ("Phase" %in% colnames(seurat_obj@meta.data) &&
+           !"cc_seurat" %in% colnames(seurat_obj@meta.data)) {
+  # Legacy single-method scoring exists - keep it but note it
+  message("Single-method cell cycle phase already present in metadata")
+  print(table(seurat_obj$Phase))
+  message("\nTo upgrade to consensus scoring, remove 'Phase' column and re-run")
+
+} else {
+  message("Scoring cell cycle phases using multiple methods...")
+
+  # Get methods from config or use defaults
+  cc_methods <- c("seurat", "module_score")
+  if (!is.null(config$cell_cycle$methods)) {
+    cc_methods <- config$cell_cycle$methods
+  }
+  message(sprintf("Methods: %s", paste(cc_methods, collapse = ", ")))
+
+  # Run multi-method consensus scoring
+  seurat_obj <- score_cell_cycle_consensus(
+    seurat_obj,
+    config = config,
+    methods = cc_methods,
+    seed = config$reproducibility$seed
+  )
 }
 
 # ==============================================================================
@@ -736,6 +736,25 @@ if ("Phase" %in% colnames(seurat_obj@meta.data) &&
     annotate("text", x = 0.5, y = 0.5, label = "Cell cycle not scored")
 }
 
+# Plot 7: Cell cycle consensus diagnostics (if multi-method scoring was used)
+if ("cc_consensus" %in% colnames(seurat_obj@meta.data)) {
+  message("Creating cell cycle consensus diagnostic plot...")
+  cc_diagnostic_plot <- tryCatch({
+    plot_cell_cycle_diagnostics(seurat_obj, config)
+  }, error = function(e) {
+    message(sprintf("  Could not generate diagnostic plot: %s", e$message))
+    NULL
+  })
+
+  if (!is.null(cc_diagnostic_plot)) {
+    cc_plot_path <- file.path(fig_dir, "01_cell_cycle_consensus_diagnostics")
+    ggsave(paste0(cc_plot_path, ".pdf"), cc_diagnostic_plot, width = 12, height = 10)
+    ggsave(paste0(cc_plot_path, ".png"), cc_diagnostic_plot, width = 12, height = 10, dpi = 300)
+    message(sprintf("Saved: %s.pdf/.png", cc_plot_path))
+  }
+}
+
+
 # Combine plots
 message("Combining diagnostic plots...")
 if (!is.null(p3)) {
@@ -833,6 +852,72 @@ write.csv(signatures_df,
           row.names = FALSE)
 message(sprintf("Saved gene signatures: %s",
                 file.path(tables_dir, "01_gene_signatures_used.csv")))
+
+# Evaluate cell cycle scoring statistics
+if ("cc_consensus" %in% colnames(seurat_obj@meta.data)) {
+  message("\nEvaluating cell cycle scoring statistics...")
+
+  cc_stats <- tryCatch({
+    evaluate_cell_cycle_statistics(
+      seurat_obj,
+      config = config,
+      proliferation_markers = c("MKI67", "TOP2A", "PCNA", "STMN1", "CDK1", "CCNB1")
+    )
+  }, error = function(e) {
+    message(sprintf("  Could not evaluate statistics: %s", e$message))
+    NULL
+  })
+
+  if (!is.null(cc_stats)) {
+    # Determine table directory (handle both table_dir and tables_dir variable names)
+    cc_table_dir <- if (exists("table_dir")) {
+      table_dir
+    } else if (exists("tables_dir")) {
+      tables_dir
+    } else {
+      get_path(config, config$paths$tables_dir)
+    }
+
+    # Ensure directory exists
+    if (!dir.exists(cc_table_dir)) {
+      dir.create(cc_table_dir, recursive = TRUE)
+    }
+
+    # Save statistics as RDS
+    stats_path <- file.path(cc_table_dir, "01_cell_cycle_statistics.rds")
+    saveRDS(cc_stats, stats_path)
+    message(sprintf("Saved cell cycle statistics: %s", stats_path))
+
+    # Generate and save markdown report
+    report_path <- file.path(cc_table_dir, "01_cell_cycle_evaluation_report.md")
+    tryCatch({
+      generate_cell_cycle_report(cc_stats, report_path)
+    }, error = function(e) {
+      message(sprintf("  Could not generate report: %s", e$message))
+    })
+
+    # Save summary table as CSV
+    if (!is.null(cc_stats$marker_validation)) {
+      marker_path <- file.path(cc_table_dir, "01_cell_cycle_marker_validation.csv")
+      write.csv(cc_stats$marker_validation, marker_path, row.names = FALSE)
+      message(sprintf("Saved marker validation: %s", marker_path))
+    }
+
+    # Save pairwise agreement as CSV
+    if (!is.null(cc_stats$pairwise_kappa)) {
+      kappa_df <- do.call(rbind, lapply(names(cc_stats$pairwise_kappa), function(pair) {
+        data.frame(
+          comparison = pair,
+          cohens_kappa = cc_stats$pairwise_kappa[[pair]]$kappa,
+          percent_agreement = cc_stats$pairwise_kappa[[pair]]$percent_agreement
+        )
+      }))
+      kappa_path <- file.path(cc_table_dir, "01_cell_cycle_method_agreement.csv")
+      write.csv(kappa_df, kappa_path, row.names = FALSE)
+      message(sprintf("Saved method agreement: %s", kappa_path))
+    }
+  }
+}
 
 # ==============================================================================
 # COMPLETION

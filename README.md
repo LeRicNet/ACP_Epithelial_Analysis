@@ -19,7 +19,7 @@ This repository contains all code required to reproduce the epithelial subtype c
 
 ```r
 # Clone the repository
-git clone https://github.com/your-username/ACP_Epithelial_Analysis.git
+git clone https://github.com/lericnet/ACP_Epithelial_Analysis.git
 cd ACP_Epithelial_Analysis
 
 # Install dependencies using renv
