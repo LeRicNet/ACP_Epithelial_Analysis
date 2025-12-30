@@ -31,6 +31,7 @@ paths:
   processed_spatial: "data/processed/spatial_processed.rds"
   classification_results: "data/processed/classification_results.rds"
   trajectory_results: "data/processed/trajectory_results.rds"
+  merged_dataset: "data/processed/merged_acp_gse.rds"
 
   # Results outputs
   tables_dir: "results/tables"

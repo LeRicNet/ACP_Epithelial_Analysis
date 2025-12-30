@@ -42,6 +42,9 @@ paths:
   spatial_object_with_subtypes: "data/raw/spatial-object-with-epithelial-subtypes.rds"
   snrnaseq_processed: "data/external/GSE215932/GSE215932_snRNA_processed.rds"
   acp_scn_annotated: "data/raw/acp_scn_annotated.rds"
+  
+  # Merged dataset (created by 00_merge_datasets.R)
+  merged_dataset: "data/processed/merged_acp_gse.rds"
 
   # Output directories
   tables_dir: "results/tables"
@@ -54,11 +57,26 @@ paths:
 |------|-------------|
 | `spatial_object` | Primary 10x Visium Seurat object |
 | `spatial_object_with_subtypes` | Visium object with existing classifications (for comparison) |
-| `snrnaseq_processed` | Processed snRNA-seq validation data |
+| `snrnaseq_processed` | Processed snRNA-seq validation data (GSE215932) |
 | `acp_scn_annotated` | ACP scRNA-seq annotated object |
+| `merged_dataset` | Combined ACP + GSE dataset (created by `00_merge_datasets.R`) |
 | `*_dir` | Output directories (created automatically) |
 
 **Note**: Paths are relative to project root. Use `get_path(config, config$paths$...)` in R code.
+
+### Merged Dataset Notes
+
+The merged dataset is created by `00_merge_datasets.R` which:
+- Extracts **raw counts** from ACP (not variable features)
+- Finds common genes between ACP and GSE
+- Harmonizes metadata (sample, dataset, is_epithelial columns)
+- Optionally integrates (batch correction) with `--integrate` flag
+
+Two versions may exist:
+- `merged_acp_gse.rds` - Basic merge (no batch correction)
+- `merged_acp_gse_integrated.rds` - With Seurat integration
+
+The script auto-detects which version exists.
 
 ---
 
@@ -138,6 +156,15 @@ classification:
 | `method` | `"module_score"` | Classification approach |
 | `min_score_threshold` | `0.1` | Minimum score to assign a subtype (cells below = "Unassigned") |
 
+### Dataset-Specific Threshold Recommendations
+
+| Dataset | Recommended Threshold | Notes |
+|---------|----------------------|-------|
+| `spatial` | 0.10 | Standard threshold works well |
+| `acp_scn` | 0.10 | Works well with full gene counts |
+| `snrnaseq` | 0.05 | Lower scores typical; reduce threshold |
+| `merged` | 0.10 | Trade-off; GSE will have higher unassigned |
+
 ### Transit-Amplifying Identification
 
 ```yaml
@@ -156,10 +183,24 @@ classification:
 | `require_cycling` | `true` | Require S/G2M phase for TA assignment |
 | `override_on_high_proliferation` | `true` | Allow high proliferation to override other subtypes |
 
+### Per-Sample Analysis Settings
+
+The script automatically performs per-sample statistical analysis:
+
+| Analysis | Description |
+|----------|-------------|
+| Chi-square test | Tests subtype × sample independence |
+| Kruskal-Wallis test | Tests module score differences across samples |
+| Jensen-Shannon divergence | Pairwise sample similarity matrix |
+| Coefficient of Variation | Flags subtypes with CV > 50% |
+
+Sample column auto-detection order: `sample`, `Sample`, `sample_id`, `Sample_ID`, `orig.ident`, `patient`, `Patient`, `donor`, `Donor`
+
 **Tuning tips**:
 - High unassigned rate → lower `min_score_threshold` (try 0.05)
 - Too many TA cells → increase `proliferation_threshold`
 - snRNA-seq often needs lower thresholds than spatial data
+- For merged datasets: check `01_dataset_comparison_merged.csv` to see ACP vs GSE differences
 
 ---
 
@@ -410,6 +451,18 @@ classification:
     proliferation_threshold: 0.10
 ```
 
+### Merged Dataset Analysis
+
+```yaml
+paths:
+  merged_dataset: "data/processed/merged_acp_gse.rds"
+
+classification:
+  min_score_threshold: 0.10  # Balance between ACP and GSE
+```
+
+**Note**: For merged datasets, ACP samples typically classify better than GSE samples at the same threshold. Review `01_classification_by_dataset_merged.csv` to check for systematic differences.
+
 ### Highly filtered data (few genes)
 
 ```yaml
@@ -422,3 +475,14 @@ signatures:
       - KRT14
       - TP63
 ```
+
+### Using Integrated Merged Data
+
+If batch effects are a concern:
+
+```bash
+# Create integrated merged dataset
+Rscript scripts/00_merge_datasets.R --integrate
+```
+
+This creates `merged_acp_gse_integrated.rds` with batch-corrected values. The script auto-detects and uses the integrated version if present.

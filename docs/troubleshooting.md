@@ -6,6 +6,8 @@ Common issues and solutions for the ACP Epithelial Differentiation Analysis pipe
 
 - [Classification Issues](#classification-issues)
 - [Gene Coverage Problems](#gene-coverage-problems)
+- [Dataset Merging Issues](#dataset-merging-issues)
+- [Per-Sample Analysis Issues](#per-sample-analysis-issues)
 - [Trajectory Analysis Issues](#trajectory-analysis-issues)
 - [Memory and Performance](#memory-and-performance)
 - [Data Format Errors](#data-format-errors)
@@ -77,6 +79,34 @@ Common issues and solutions for the ACP Epithelial Differentiation Analysis pipe
 - Check if `hybrid_detection.enabled: true` in config
 - May indicate clean separation between subtypes (not necessarily a problem)
 
+### ACP vs GSE Classification Differences (Merged Data)
+
+**Symptoms**: Large differences in classification between datasets (e.g., ACP 15% unassigned, GSE 55% unassigned).
+
+**This is expected** due to:
+- Different normalization methods
+- Different sequencing depths
+- Different cell isolation protocols
+- snRNA-seq vs scRNA-seq differences
+
+**Solutions**:
+
+1. **Check the comparison table**
+   ```bash
+   cat results/tables/01_classification_by_dataset_merged.csv
+   ```
+
+2. **Consider dataset-specific thresholds**
+   - Currently not implemented, but can be done manually by classifying datasets separately
+
+3. **Use integrated data**
+   ```bash
+   Rscript scripts/00_merge_datasets.R --integrate
+   ```
+   This reduces but doesn't eliminate systematic differences.
+
+4. **Accept the differences** - they may reflect real biological variation
+
 ---
 
 ## Gene Coverage Problems
@@ -120,6 +150,7 @@ print(signature_genes[!present])  # Missing genes
 
 **Solutions**:
 - Use raw or less-filtered object for classification
+- For ACP data: use `00_merge_datasets.R` to extract full counts from RNA assay
 - Transfer labels back to integrated object after classification:
   ```r
   # Classify on full object
@@ -129,6 +160,150 @@ print(signature_genes[!present])  # Missing genes
   # Transfer to integrated
   integrated_obj$epithelial_subtype <- full_obj$epithelial_subtype[Cells(integrated_obj)]
   ```
+
+---
+
+## Dataset Merging Issues
+
+### "Could not extract raw counts" Error
+
+**Symptoms**: `00_merge_datasets.R` fails to extract counts from ACP object.
+
+**Diagnosis**:
+```r
+obj <- readRDS("acp_scn_annotated.rds")
+Assays(obj)                    # List assays
+Layers(obj[["RNA"]])           # List layers in RNA assay
+dim(LayerData(obj, "RNA", "counts"))  # Check dimensions
+```
+
+**Solutions**:
+
+1. **Seurat v5 API issues**
+   
+   The script uses `LayerData()` for Seurat v5. If your object is v4:
+   ```r
+   # Manually extract for Seurat v4
+   counts <- GetAssayData(obj, slot = "counts", assay = "RNA")
+   ```
+
+2. **No counts layer, only data**
+   
+   If counts are empty but data exists, the script will use log-normalized data with a warning. This is acceptable but not ideal.
+
+3. **Object saved without counts**
+   
+   Some objects save only normalized data. You'll need the original pre-processed object.
+
+### Low Common Gene Count
+
+**Symptoms**: "Common genes: 5,000" (expected >20,000)
+
+**Causes**:
+- Different gene annotations (symbols vs Ensembl IDs)
+- One dataset heavily filtered
+- Species mismatch
+
+**Solutions**:
+
+1. **Check gene name formats**
+   ```r
+   head(rownames(acp_obj))   # e.g., "GAPDH"
+   head(rownames(gse_obj))   # e.g., "ENSG00000111640"
+   ```
+
+2. **Convert Ensembl to symbols if needed**
+   ```r
+   library(biomaRt)
+   # ... conversion code
+   ```
+
+### Integration Fails
+
+**Symptoms**: `--integrate` flag causes errors in `FindIntegrationAnchors()`.
+
+**Solutions**:
+
+1. **Reduce dimensions**
+   ```r
+   anchors <- FindIntegrationAnchors(object.list, dims = 1:20)  # instead of 1:30
+   ```
+
+2. **Use reference-based integration**
+   ```r
+   anchors <- FindIntegrationAnchors(
+     object.list,
+     reference = 1,  # Use first object as reference
+     dims = 1:30
+   )
+   ```
+
+3. **Skip integration** - the basic merge often works well enough
+
+---
+
+## Per-Sample Analysis Issues
+
+### "Sample column not found"
+
+**Symptoms**: Per-sample analysis skipped, no `01_sample_*` outputs.
+
+**Solutions**:
+
+1. **Check for sample column**
+   ```r
+   colnames(seurat_obj@meta.data)
+   ```
+   
+   The script searches for: `sample`, `Sample`, `sample_id`, `Sample_ID`, `orig.ident`, `patient`, `Patient`, `donor`, `Donor`
+
+2. **Create sample column if missing**
+   ```r
+   seurat_obj$sample <- seurat_obj$orig.ident  # or appropriate column
+   ```
+
+### Samples with Very Few Cells
+
+**Symptoms**: Warnings about samples with <10 cells; unreliable statistics.
+
+**Interpretation**:
+- JS divergence for small samples is unreliable
+- CV calculations may be inflated
+- Consider filtering samples with <50 epithelial cells
+
+**Solutions**:
+```r
+# Filter small samples before analysis
+sample_counts <- table(seurat_obj$sample)
+good_samples <- names(sample_counts[sample_counts >= 50])
+seurat_obj <- subset(seurat_obj, sample %in% good_samples)
+```
+
+### High CV for All Subtypes
+
+**Symptoms**: All subtypes show CV >50% (high variability).
+
+**Interpretation**:
+- Could indicate real biological heterogeneity
+- Could indicate batch effects
+- Could indicate inconsistent sample processing
+
+**Solutions**:
+
+1. **Check JS divergence matrix** - identify outlier samples
+2. **Consider batch correction** - run `00_merge_datasets.R --integrate`
+3. **Stratify analysis** - analyze sample groups separately
+
+### Chi-square Test Issues
+
+**Symptoms**: "Expected frequencies <5" warning, or test fails.
+
+**Cause**: Small cell counts in some sample × subtype combinations.
+
+**Solutions**:
+- Script automatically uses Monte Carlo simulation (B=10,000) for small expected values
+- Consider combining rare subtypes for statistical testing
+- The warning doesn't invalidate results, just indicates lower power
 
 ---
 
@@ -310,6 +485,28 @@ seurat_obj@assays$RNA@data
 # Convert v5 to v4-style if needed
 seurat_obj[["RNA"]] <- as(seurat_obj[["RNA"]], "Assay")
 ```
+
+### Cyclone Method Failed Warning
+
+**Symptoms**: 
+```
+Cyclone method failed: Please use the `layer` argument instead.
+```
+
+**Cause**: The scran Cyclone classifier uses Seurat v4-style `GetAssayData(slot=...)` which is deprecated in Seurat v5.
+
+**Impact**: Script falls back to 2-method consensus (Seurat + module score) instead of 3-method. Results are still valid.
+
+**Solutions**:
+1. **Ignore the warning** - consensus from 2 methods is sufficient
+2. **Update scran** - future versions may fix this
+3. **Run cyclone separately** with converted object:
+   ```r
+   # Convert to v4-style assay for cyclone
+   temp_obj <- seurat_obj
+   temp_obj[["RNA"]] <- as(temp_obj[["RNA"]], "Assay")
+   # ... run cyclone
+   ```
 
 ---
 
