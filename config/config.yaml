@@ -25,6 +25,7 @@ paths:
   spatial_object_with_subtypes: "data/raw/spatial-object-with-epithelial-subtypes.rds"
   snrnaseq_processed: "data/external/GSE215932/GSE215932_snRNA_processed.rds"
   bulk_rnaseq: "data/external/OpenPBTA/bulk_rnaseq.rds"
+  acp_scn_annotated: "data/raw/acp_scn_annotated.rds"
 
   # Processed data outputs
   processed_spatial: "data/processed/spatial_processed.rds"
