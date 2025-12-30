@@ -1,12 +1,125 @@
 # ==============================================================================
-# R/trajectory/multi_method_trajectory.R
+# R/trajectory/trajectory_analysis.R
 # ==============================================================================
 # Multi-method trajectory analysis with consensus determination
+# Updated with HPC parallelization and comprehensive statistical evaluation
 #
 # Methods implemented:
 #   1. Monocle3 - graph-based trajectory inference
 #   2. Slingshot - principal curves through clusters
 #   3. Diffusion Pseudotime - diffusion map-based ordering
+#
+# Statistical Framework:
+#   - Per-method quality metrics
+#   - Per-sample heterogeneity testing
+#   - Bootstrap confidence intervals
+#   - Permutation significance testing
+# ==============================================================================
+
+# ==============================================================================
+# PARALLELIZATION SETUP
+# ==============================================================================
+
+#' Setup Parallel Backend
+#'
+#' Configures BiocParallel and future backends for HPC execution
+#'
+#' @param n_cores Number of cores to use (default: auto-detect)
+#' @param type Backend type: "multicore" (Unix), "snow" (Windows), "serial"
+#' @param memory_per_core Memory limit per core in GB (for SLURM)
+#' @return List with configured backends
+#' @export
+setup_parallel_backend <- function(n_cores = NULL,
+                                   type = "auto",
+                                   memory_per_core = NULL) {
+
+
+  message("\n--- Setting up parallel backend ---")
+
+  # Auto-detect cores if not specified
+  if (is.null(n_cores)) {
+    # Check for SLURM environment
+    slurm_cpus <- Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA)
+    if (!is.na(slurm_cpus)) {
+      n_cores <- as.integer(slurm_cpus)
+      message(sprintf("  Detected SLURM environment: %d CPUs", n_cores))
+    } else {
+      n_cores <- max(1, parallel::detectCores() - 1)
+      message(sprintf("  Auto-detected %d cores (reserving 1)", n_cores))
+    }
+  }
+
+  # Ensure at least 1 core
+  n_cores <- max(1, n_cores)
+
+  # Determine backend type
+  if (type == "auto") {
+    type <- if (.Platform$OS.type == "unix") "multicore" else "snow"
+  }
+
+  backends <- list(
+    n_cores = n_cores,
+    type = type
+  )
+
+  # Setup BiocParallel
+  if (requireNamespace("BiocParallel", quietly = TRUE)) {
+    if (type == "multicore" && n_cores > 1) {
+      backends$bioc <- BiocParallel::MulticoreParam(
+        workers = n_cores,
+        progressbar = TRUE
+      )
+    } else if (type == "snow" && n_cores > 1) {
+      backends$bioc <- BiocParallel::SnowParam(
+        workers = n_cores,
+        progressbar = TRUE
+      )
+    } else {
+      backends$bioc <- BiocParallel::SerialParam()
+    }
+    BiocParallel::register(backends$bioc)
+    message(sprintf("  BiocParallel: %s with %d workers", type, n_cores))
+  }
+
+  # Setup future for future.apply
+  if (requireNamespace("future", quietly = TRUE)) {
+    if (type == "multicore" && n_cores > 1) {
+      future::plan(future::multicore, workers = n_cores)
+    } else if (type == "snow" && n_cores > 1) {
+      future::plan(future::multisession, workers = n_cores)
+    } else {
+      future::plan(future::sequential)
+    }
+
+    # Set memory limits if specified
+    if (!is.null(memory_per_core)) {
+      options(future.globals.maxSize = memory_per_core * 1024^3)
+    }
+
+    backends$future_plan <- future::plan()
+    message(sprintf("  future: %s", class(backends$future_plan)[1]))
+  }
+
+  # Store in options for later retrieval
+  options(trajectory.parallel.backend = backends)
+
+  return(backends)
+}
+
+#' Get Current Parallel Backend
+#'
+#' @return List with backend configuration
+#' @export
+get_parallel_backend <- function() {
+  backend <- getOption("trajectory.parallel.backend")
+  if (is.null(backend)) {
+    backend <- list(n_cores = 1, type = "serial")
+  }
+  return(backend)
+}
+
+# ==============================================================================
+# MAIN TRAJECTORY FUNCTIONS
 # ==============================================================================
 
 #' Run Multi-Method Trajectory Analysis
@@ -19,6 +132,9 @@
 #' @param subtype_column Column name containing cell type classifications
 #' @param root_subtype Subtype to use as trajectory root
 #' @param reduction Which dimensionality reduction to use (default: "umap")
+#' @param n_cores Number of cores for parallel processing
+#' @param bootstrap_ci Whether to compute bootstrap confidence intervals
+#' @param n_bootstrap Number of bootstrap iterations
 #' @return List containing results from each method and consensus pseudotime
 #' @export
 run_multi_method_trajectory <- function(seurat_obj,
@@ -26,12 +142,22 @@ run_multi_method_trajectory <- function(seurat_obj,
                                         methods = c("monocle3", "slingshot", "diffusion"),
                                         subtype_column = "module_score_subtype",
                                         root_subtype = "Basal-like",
-                                        reduction = "umap") {
-
+                                        reduction = "umap",
+                                        n_cores = NULL,
+                                        bootstrap_ci = FALSE,
+                                        n_bootstrap = 100) {
 
   message("\n========================================")
   message("Multi-Method Trajectory Analysis")
   message("========================================\n")
+
+  # Setup parallelization
+  if (is.null(n_cores) && !is.null(config$reproducibility$n_cores)) {
+    n_cores <- config$reproducibility$n_cores
+  }
+  if (!is.null(n_cores) && n_cores > 1) {
+    setup_parallel_backend(n_cores)
+  }
 
   # Get parameters from config
   if (!is.null(config)) {
@@ -72,6 +198,7 @@ run_multi_method_trajectory <- function(seurat_obj,
   rownames(pseudotime_matrix) <- colnames(seurat_obj)
   colnames(pseudotime_matrix) <- methods
   methods_used <- c()
+  method_quality <- list()
 
   # Get subtypes
   subtypes <- seurat_obj@meta.data[[subtype_column]]
@@ -101,8 +228,17 @@ run_multi_method_trajectory <- function(seurat_obj,
 
       methods_used <- c(methods_used, "monocle3")
 
+      # Calculate method quality metrics
+      method_quality$monocle3 <- evaluate_method_quality(
+        pseudotime = pt[common_cells],
+        subtypes = subtypes[match(common_cells, colnames(seurat_obj))],
+        method = "monocle3",
+        cds = monocle_result$cds
+      )
+
       message(sprintf("  Pseudotime range: [%.2f, %.2f]",
                       min(pt, na.rm = TRUE), max(pt, na.rm = TRUE)))
+      message(sprintf("  Quality score: %.3f", method_quality$monocle3$overall_quality))
 
       TRUE
     }, error = function(e) {
@@ -134,9 +270,18 @@ run_multi_method_trajectory <- function(seurat_obj,
 
       methods_used <- c(methods_used, "slingshot")
 
+      # Calculate method quality metrics
+      method_quality$slingshot <- evaluate_method_quality(
+        pseudotime = pt,
+        subtypes = subtypes[match(names(pt), colnames(seurat_obj))],
+        method = "slingshot",
+        sds = slingshot_result$sds
+      )
+
       message(sprintf("  Pseudotime range: [%.2f, %.2f]",
                       min(pt, na.rm = TRUE), max(pt, na.rm = TRUE)))
       message(sprintf("  Lineages detected: %d", slingshot_result$n_lineages))
+      message(sprintf("  Quality score: %.3f", method_quality$slingshot$overall_quality))
 
       TRUE
     }, error = function(e) {
@@ -157,7 +302,8 @@ run_multi_method_trajectory <- function(seurat_obj,
         config = config,
         subtype_column = subtype_column,
         root_subtype = root_subtype,
-        reduction = reduction
+        reduction = reduction,
+        parallel = n_cores > 1
       )
 
       results$diffusion <- diffusion_result
@@ -168,8 +314,16 @@ run_multi_method_trajectory <- function(seurat_obj,
 
       methods_used <- c(methods_used, "diffusion")
 
+      # Calculate method quality metrics
+      method_quality$diffusion <- evaluate_method_quality(
+        pseudotime = pt,
+        subtypes = subtypes[match(names(pt), colnames(seurat_obj))],
+        method = "diffusion"
+      )
+
       message(sprintf("  Pseudotime range: [%.2f, %.2f]",
                       min(pt, na.rm = TRUE), max(pt, na.rm = TRUE)))
+      message(sprintf("  Quality score: %.3f", method_quality$diffusion$overall_quality))
 
       TRUE
     }, error = function(e) {
@@ -196,6 +350,7 @@ run_multi_method_trajectory <- function(seurat_obj,
   # Store results
   results$consensus <- consensus
   results$methods_used <- methods_used
+  results$method_quality <- method_quality
   results$pseudotime_matrix <- pseudotime_matrix[, methods_used, drop = FALSE]
 
   # Add pseudotime to seurat object metadata (return updated object)
@@ -220,6 +375,31 @@ run_multi_method_trajectory <- function(seurat_obj,
                       method = "spearman", use = "pairwise.complete.obs")
     print(round(cor_matrix, 3))
     results$method_correlations <- cor_matrix
+  }
+
+  # ===========================================================================
+  # Bootstrap Confidence Intervals (if requested)
+  # ===========================================================================
+  if (bootstrap_ci && length(methods_used) > 1) {
+    message("\n--- Computing Bootstrap Confidence Intervals ---")
+
+    bootstrap_results <- bootstrap_pseudotime_ci(
+      seurat_obj = seurat_obj,
+      methods = methods_used,
+      config = config,
+      subtype_column = subtype_column,
+      root_subtype = root_subtype,
+      reduction = reduction,
+      n_bootstrap = n_bootstrap,
+      parallel = n_cores > 1
+    )
+
+    results$bootstrap <- bootstrap_results
+    results$seurat_obj$pseudotime_ci_lower <- bootstrap_results$ci_lower
+    results$seurat_obj$pseudotime_ci_upper <- bootstrap_results$ci_upper
+    results$seurat_obj$pseudotime_ci_width <- bootstrap_results$ci_width
+
+    message(sprintf("  Mean CI width: %.3f", mean(bootstrap_results$ci_width, na.rm = TRUE)))
   }
 
   return(results)
@@ -301,9 +481,19 @@ run_monocle3_trajectory <- function(seurat_obj, config = NULL,
   degree <- igraph::degree(graph)
   n_branch_points <- sum(degree > 2)
 
+  # Calculate graph metrics
+  graph_metrics <- list(
+    n_nodes = igraph::vcount(graph),
+    n_edges = igraph::ecount(graph),
+    n_branch_points = n_branch_points,
+    n_tips = sum(degree == 1),
+    graph_diameter = igraph::diameter(graph)
+  )
+
   return(list(
     cds = cds,
     n_branch_points = n_branch_points,
+    graph_metrics = graph_metrics,
     method = "monocle3"
   ))
 }
@@ -387,18 +577,27 @@ run_slingshot_trajectory <- function(seurat_obj, config = NULL,
   # Get curves
   curves <- slingshot::slingCurves(sds)
 
+  # Calculate curve metrics
+  curve_metrics <- list(
+    n_lineages = n_lineages,
+    lineage_clusters = lineages,
+    curve_lengths = sapply(curves, function(c) sum(c$lambda))
+  )
+
   return(list(
     sds = sds,
     pseudotime = pseudotime,
+    pseudotime_matrix = pt_matrix,
     n_lineages = n_lineages,
     lineages = lineages,
     curves = curves,
+    curve_metrics = curve_metrics,
     method = "slingshot"
   ))
 }
 
 
-#' Run Diffusion Pseudotime Analysis
+#' Run Diffusion Pseudotime Analysis (Parallelized)
 #'
 #' Simple diffusion-based pseudotime using destiny package or manual calculation
 #'
@@ -407,12 +606,14 @@ run_slingshot_trajectory <- function(seurat_obj, config = NULL,
 #' @param subtype_column Column with cell types
 #' @param root_subtype Root cell type
 #' @param reduction Dimensionality reduction to use
+#' @param parallel Whether to use parallel processing
 #' @return List with diffusion results and pseudotime
 #' @keywords internal
 run_diffusion_pseudotime <- function(seurat_obj, config = NULL,
                                      subtype_column = "module_score_subtype",
                                      root_subtype = "Basal-like",
-                                     reduction = "pca") {
+                                     reduction = "pca",
+                                     parallel = FALSE) {
 
   # Get PCA or specified reduction
   if (reduction == "pca" && "pca" %in% names(seurat_obj@reductions)) {
@@ -420,6 +621,9 @@ run_diffusion_pseudotime <- function(seurat_obj, config = NULL,
   } else {
     data_matrix <- Seurat::Embeddings(seurat_obj, reduction)
   }
+
+  n_cells <- nrow(data_matrix)
+  message(sprintf("  Processing %d cells...", n_cells))
 
   # Try using destiny package if available
   if (requireNamespace("destiny", quietly = TRUE)) {
@@ -459,11 +663,27 @@ run_diffusion_pseudotime <- function(seurat_obj, config = NULL,
 
     k <- 30  # Number of neighbors
 
-    # Compute distances
-    dist_matrix <- as.matrix(dist(data_matrix))
+    # Compute distances - PARALLELIZED for large datasets
+    if (parallel && n_cells > 1000 && requireNamespace("future.apply", quietly = TRUE)) {
+      message("  Computing distances (parallel)...")
+
+      # Split into chunks for parallel processing
+      chunk_size <- ceiling(n_cells / get_parallel_backend()$n_cores)
+      chunks <- split(1:n_cells, ceiling(1:n_cells / chunk_size))
+
+      dist_list <- future.apply::future_lapply(chunks, function(idx) {
+        as.matrix(dist(data_matrix))[idx, , drop = FALSE]
+      }, future.seed = TRUE)
+
+      dist_matrix <- do.call(rbind, dist_list)
+
+    } else {
+      message("  Computing distances (serial)...")
+      dist_matrix <- as.matrix(dist(data_matrix))
+    }
 
     # Build k-NN graph and transition probabilities
-    n_cells <- nrow(data_matrix)
+    message("  Building transition matrix...")
     trans_prob <- matrix(0, n_cells, n_cells)
 
     for (i in 1:n_cells) {
@@ -477,6 +697,7 @@ run_diffusion_pseudotime <- function(seurat_obj, config = NULL,
     trans_prob <- (trans_prob + t(trans_prob)) / 2
 
     # Compute first few eigenvectors of transition matrix
+    message("  Computing eigenvectors...")
     eigen_result <- eigen(trans_prob, symmetric = TRUE)
     dc <- eigen_result$vectors[, 2:3]  # Skip first (trivial) eigenvector
 
@@ -496,6 +717,8 @@ run_diffusion_pseudotime <- function(seurat_obj, config = NULL,
     return(list(
       diffusion_components = dc,
       pseudotime = pseudotime,
+      transition_matrix = trans_prob,
+      eigenvalues = eigen_result$values[1:10],
       method = "diffusion_manual"
     ))
   }
@@ -572,7 +795,11 @@ calculate_consensus_pseudotime <- function(pseudotime_matrix, subtypes = NULL) {
 }
 
 
-#' Run Per-Sample Multi-Method Trajectory
+# ==============================================================================
+# PER-SAMPLE ANALYSIS (PARALLELIZED)
+# ==============================================================================
+
+#' Run Per-Sample Multi-Method Trajectory (Parallelized)
 #'
 #' Runs trajectory analysis separately for each sample using multiple methods
 #'
@@ -581,12 +808,14 @@ calculate_consensus_pseudotime <- function(pseudotime_matrix, subtypes = NULL) {
 #' @param methods Trajectory methods to use
 #' @param sample_column Column containing sample IDs
 #' @param subtype_column Column containing subtypes
+#' @param parallel Whether to run samples in parallel
 #' @return List with per-sample results and cross-sample concordance
 #' @export
 run_per_sample_multi_trajectory <- function(seurat_obj, config = NULL,
                                             methods = c("monocle3", "slingshot"),
                                             sample_column = "sample",
-                                            subtype_column = "module_score_subtype") {
+                                            subtype_column = "module_score_subtype",
+                                            parallel = TRUE) {
 
   message("\n========================================")
   message("Per-Sample Multi-Method Trajectory Analysis")
@@ -612,40 +841,42 @@ run_per_sample_multi_trajectory <- function(seurat_obj, config = NULL,
     min_cells <- config$trajectory$per_sample$min_cells_per_sample
   }
 
-  # Store results
-  all_results <- list()
+  # Determine if we should run in parallel
+  backend <- get_parallel_backend()
+  use_parallel <- parallel && backend$n_cores > 1 && length(samples) > 1
 
-  for (sample_id in samples) {
-    message(sprintf("\n=== Sample: %s ===", sample_id))
+  if (use_parallel) {
+    message(sprintf("Running %d samples in parallel across %d cores",
+                    length(samples), backend$n_cores))
+  }
 
+  # Function to process single sample
+  process_sample <- function(sample_id) {
     # Subset
     cells_in_sample <- seurat_obj@meta.data[[sample_column]] == sample_id
     cells_in_sample[is.na(cells_in_sample)] <- FALSE
     n_cells <- sum(cells_in_sample)
 
-    message(sprintf("  Cells: %d", n_cells))
-
     if (n_cells < min_cells) {
-      message(sprintf("  Skipping: fewer than %d cells", min_cells))
-      all_results[[sample_id]] <- list(
+      return(list(
         sample = sample_id,
         n_cells = n_cells,
         skipped = TRUE,
         reason = "insufficient_cells"
-      )
-      next
+      ))
     }
 
     # Subset Seurat
     seurat_sample <- subset(seurat_obj, cells = colnames(seurat_obj)[cells_in_sample])
 
-    # Run multi-method trajectory
+    # Run multi-method trajectory (without further parallelization to avoid nesting)
     tryCatch({
       sample_result <- run_multi_method_trajectory(
         seurat_sample,
         config = config,
         methods = methods,
-        subtype_column = subtype_column
+        subtype_column = subtype_column,
+        n_cores = 1  # No nested parallelization
       )
 
       # Calculate per-subtype mean pseudotime
@@ -653,7 +884,7 @@ run_per_sample_multi_trajectory <- function(seurat_obj, config = NULL,
       pt_by_subtype <- tapply(sample_result$consensus$pseudotime, subtypes, mean, na.rm = TRUE)
       subtype_rank <- rank(pt_by_subtype)
 
-      all_results[[sample_id]] <- list(
+      list(
         sample = sample_id,
         n_cells = n_cells,
         skipped = FALSE,
@@ -661,15 +892,12 @@ run_per_sample_multi_trajectory <- function(seurat_obj, config = NULL,
         pseudotime_by_subtype = pt_by_subtype,
         subtype_rank = subtype_rank,
         subtype_order = names(sort(pt_by_subtype)),
-        methods_used = sample_result$methods_used
+        methods_used = sample_result$methods_used,
+        method_quality = sample_result$method_quality
       )
 
-      message(sprintf("  Subtype order: %s",
-                      paste(names(sort(pt_by_subtype)), collapse = " → ")))
-
     }, error = function(e) {
-      message(sprintf("  ERROR: %s", e$message))
-      all_results[[sample_id]] <- list(
+      list(
         sample = sample_id,
         n_cells = n_cells,
         skipped = TRUE,
@@ -679,10 +907,38 @@ run_per_sample_multi_trajectory <- function(seurat_obj, config = NULL,
     })
   }
 
+  # Run analysis
+  if (use_parallel && requireNamespace("future.apply", quietly = TRUE)) {
+    all_results <- future.apply::future_lapply(
+      samples,
+      process_sample,
+      future.seed = TRUE
+    )
+    names(all_results) <- samples
+  } else {
+    # Sequential processing with progress
+    all_results <- list()
+    for (i in seq_along(samples)) {
+      sample_id <- samples[i]
+      message(sprintf("\n=== Sample %d/%d: %s ===", i, length(samples), sample_id))
+      all_results[[sample_id]] <- process_sample(sample_id)
+
+      if (!all_results[[sample_id]]$skipped) {
+        message(sprintf("  Subtype order: %s",
+                        paste(all_results[[sample_id]]$subtype_order, collapse = " → ")))
+      }
+    }
+  }
+
   # Calculate cross-sample concordance
   message("\n=== Cross-Sample Concordance ===")
   concordance <- calculate_cross_sample_concordance(all_results)
   attr(all_results, "concordance") <- concordance
+
+  # Calculate sample heterogeneity statistics
+  message("\n=== Sample Heterogeneity Statistics ===")
+  heterogeneity <- evaluate_sample_heterogeneity(all_results)
+  attr(all_results, "heterogeneity") <- heterogeneity
 
   return(all_results)
 }
@@ -719,6 +975,7 @@ calculate_cross_sample_concordance <- function(results) {
   # Pairwise Spearman correlations
   n_samples <- ncol(rank_matrix)
   correlations <- c()
+  pairwise_results <- list()
 
   for (i in 1:(n_samples - 1)) {
     for (j in (i + 1):n_samples) {
@@ -727,6 +984,14 @@ calculate_cross_sample_concordance <- function(results) {
         rho <- cor(rank_matrix[shared, i], rank_matrix[shared, j],
                    method = "spearman", use = "complete.obs")
         correlations <- c(correlations, rho)
+
+        pair_name <- paste(colnames(rank_matrix)[i], colnames(rank_matrix)[j], sep = "_vs_")
+        pairwise_results[[pair_name]] <- list(
+          sample1 = colnames(rank_matrix)[i],
+          sample2 = colnames(rank_matrix)[j],
+          correlation = rho,
+          n_shared = sum(shared)
+        )
       }
     }
   }
@@ -737,6 +1002,8 @@ calculate_cross_sample_concordance <- function(results) {
     sd_correlation = sd(correlations, na.rm = TRUE),
     min_correlation = min(correlations, na.rm = TRUE),
     max_correlation = max(correlations, na.rm = TRUE),
+    all_correlations = correlations,
+    pairwise_results = pairwise_results,
     n_comparisons = length(correlations),
     n_samples = n_samples
   )
@@ -749,6 +1016,550 @@ calculate_cross_sample_concordance <- function(results) {
   return(concordance)
 }
 
+
+# ==============================================================================
+# METHOD QUALITY EVALUATION
+# ==============================================================================
+
+#' Evaluate Method Quality
+#'
+#' Computes quality metrics for a single trajectory method
+#'
+#' @param pseudotime Pseudotime vector
+#' @param subtypes Cell type labels
+#' @param method Method name
+#' @param cds Monocle3 cds object (optional)
+#' @param sds Slingshot object (optional)
+#' @return List with quality metrics
+#' @export
+evaluate_method_quality <- function(pseudotime, subtypes, method,
+                                    cds = NULL, sds = NULL) {
+
+  quality <- list(method = method)
+
+  # 1. Pseudotime spread (should be well distributed)
+  pt_range <- diff(range(pseudotime, na.rm = TRUE))
+  pt_iqr <- IQR(pseudotime, na.rm = TRUE)
+  quality$spread <- list(
+    range = pt_range,
+    iqr = pt_iqr,
+    cv = sd(pseudotime, na.rm = TRUE) / mean(pseudotime, na.rm = TRUE)
+  )
+
+  # 2. Subtype separation (should show clear ordering)
+  if (!is.null(subtypes) && length(unique(subtypes)) > 1) {
+    pt_by_subtype <- tapply(pseudotime, subtypes, mean, na.rm = TRUE)
+
+    # Between-group variance / total variance
+    total_var <- var(pseudotime, na.rm = TRUE)
+    between_var <- var(pt_by_subtype)
+    quality$separation <- between_var / total_var
+
+    # Kruskal-Wallis test
+    kw_test <- kruskal.test(pseudotime ~ subtypes)
+    quality$kruskal_wallis <- list(
+      statistic = kw_test$statistic,
+      p_value = kw_test$p.value
+    )
+  }
+
+  # 3. Trajectory continuity (cells should have similar pseudotime to neighbors)
+  # This requires additional computation, so we'll estimate from variance
+  quality$continuity <- 1 - (sd(diff(sort(pseudotime)), na.rm = TRUE) / pt_range)
+
+  # 4. Method-specific metrics
+  if (!is.null(cds) && method == "monocle3") {
+    # Graph coherence
+    graph <- monocle3::principal_graph(cds)$UMAP
+    degree_dist <- table(igraph::degree(graph))
+    quality$graph_metrics <- list(
+      mean_degree = mean(igraph::degree(graph)),
+      n_branch_points = sum(igraph::degree(graph) > 2),
+      n_tips = sum(igraph::degree(graph) == 1)
+    )
+  }
+
+  if (!is.null(sds) && method == "slingshot") {
+    quality$lineage_metrics <- list(
+      n_lineages = length(slingshot::slingLineages(sds)),
+      curve_coverage = mean(!is.na(slingshot::slingPseudotime(sds)))
+    )
+  }
+
+  # 5. Overall quality score (weighted combination)
+  score_components <- c()
+
+  # Separation (higher is better)
+  if (!is.null(quality$separation)) {
+    score_components["separation"] <- min(quality$separation, 1)
+  }
+
+  # Continuity (higher is better)
+  if (!is.null(quality$continuity) && !is.na(quality$continuity)) {
+    score_components["continuity"] <- max(0, quality$continuity)
+  }
+
+  # Statistical significance (p < 0.05 = good)
+  if (!is.null(quality$kruskal_wallis)) {
+    score_components["significance"] <- ifelse(quality$kruskal_wallis$p_value < 0.05, 1, 0.5)
+  }
+
+  quality$overall_quality <- mean(score_components, na.rm = TRUE)
+  quality$quality_components <- score_components
+
+  return(quality)
+}
+
+
+# ==============================================================================
+# SAMPLE HETEROGENEITY EVALUATION
+# ==============================================================================
+
+#' Evaluate Sample Heterogeneity
+#'
+#' Statistical tests for heterogeneity across samples
+#'
+#' @param results Per-sample trajectory results
+#' @return List with heterogeneity statistics
+#' @export
+evaluate_sample_heterogeneity <- function(results) {
+
+  valid_results <- results[sapply(results, function(x) !x$skipped)]
+
+  if (length(valid_results) < 2) {
+    return(list(
+      n_samples = length(valid_results),
+      heterogeneity_test = NA,
+      message = "Insufficient samples for heterogeneity testing"
+    ))
+  }
+
+  heterogeneity <- list(n_samples = length(valid_results))
+
+  # 1. Concordance-based heterogeneity
+  concordance <- attr(results, "concordance")
+  if (!is.null(concordance) && !is.na(concordance$mean_correlation)) {
+    # High correlation = low heterogeneity
+    heterogeneity$concordance_based <- list(
+      mean_correlation = concordance$mean_correlation,
+      heterogeneity_index = 1 - concordance$mean_correlation,
+      interpretation = ifelse(concordance$mean_correlation > 0.7, "Low heterogeneity",
+                              ifelse(concordance$mean_correlation > 0.4, "Moderate heterogeneity",
+                                     "High heterogeneity"))
+    )
+  }
+
+  # 2. Ranking consistency test (Friedman test if >= 3 samples)
+  if (length(valid_results) >= 3) {
+    # Build data for Friedman test
+    rank_matrix <- concordance$rank_matrix
+
+    # Remove subtypes with missing values
+    complete_subtypes <- rowSums(is.na(rank_matrix)) == 0
+    if (sum(complete_subtypes) >= 3) {
+      rank_complete <- rank_matrix[complete_subtypes, ]
+
+      tryCatch({
+        # Reshape for Friedman test
+        friedman_data <- as.data.frame(t(rank_complete))
+        friedman_result <- friedman.test(as.matrix(friedman_data))
+
+        heterogeneity$friedman_test <- list(
+          statistic = friedman_result$statistic,
+          p_value = friedman_result$p.value,
+          significant = friedman_result$p.value < 0.05,
+          interpretation = ifelse(friedman_result$p.value < 0.05,
+                                  "Significant ordering difference across samples",
+                                  "Consistent ordering across samples")
+        )
+      }, error = function(e) {
+        heterogeneity$friedman_test <- list(error = e$message)
+      })
+    }
+  }
+
+  # 3. Per-sample quality comparison
+  sample_qualities <- sapply(valid_results, function(x) {
+    if (!is.null(x$method_quality)) {
+      mean(sapply(x$method_quality, function(m) m$overall_quality), na.rm = TRUE)
+    } else {
+      NA
+    }
+  })
+
+  heterogeneity$quality_comparison <- list(
+    mean_quality = mean(sample_qualities, na.rm = TRUE),
+    sd_quality = sd(sample_qualities, na.rm = TRUE),
+    min_quality = min(sample_qualities, na.rm = TRUE),
+    max_quality = max(sample_qualities, na.rm = TRUE),
+    per_sample = sample_qualities
+  )
+
+  # 4. Outlier sample detection
+  if (length(sample_qualities) >= 3) {
+    # Use IQR-based outlier detection
+    q1 <- quantile(sample_qualities, 0.25, na.rm = TRUE)
+    q3 <- quantile(sample_qualities, 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+
+    outliers <- names(sample_qualities)[sample_qualities < lower_bound |
+                                          sample_qualities > upper_bound]
+
+    heterogeneity$outlier_samples <- list(
+      outliers = outliers,
+      n_outliers = length(outliers),
+      bounds = c(lower = lower_bound, upper = upper_bound)
+    )
+  }
+
+  # 5. Overall heterogeneity summary
+  heterogeneity$summary <- list(
+    is_heterogeneous = FALSE,
+    reasons = c()
+  )
+
+  if (!is.null(heterogeneity$concordance_based) &&
+      heterogeneity$concordance_based$mean_correlation < 0.5) {
+    heterogeneity$summary$is_heterogeneous <- TRUE
+    heterogeneity$summary$reasons <- c(heterogeneity$summary$reasons,
+                                       "Low cross-sample concordance")
+  }
+
+  if (!is.null(heterogeneity$friedman_test) &&
+      !is.null(heterogeneity$friedman_test$significant) &&
+      heterogeneity$friedman_test$significant) {
+    heterogeneity$summary$is_heterogeneous <- TRUE
+    heterogeneity$summary$reasons <- c(heterogeneity$summary$reasons,
+                                       "Significant Friedman test")
+  }
+
+  if (!is.null(heterogeneity$outlier_samples) &&
+      heterogeneity$outlier_samples$n_outliers > 0) {
+    heterogeneity$summary$is_heterogeneous <- TRUE
+    heterogeneity$summary$reasons <- c(heterogeneity$summary$reasons,
+                                       paste("Outlier samples:",
+                                             paste(heterogeneity$outlier_samples$outliers,
+                                                   collapse = ", ")))
+  }
+
+  message(sprintf("  Heterogeneity: %s",
+                  ifelse(heterogeneity$summary$is_heterogeneous, "DETECTED", "NOT DETECTED")))
+  if (length(heterogeneity$summary$reasons) > 0) {
+    for (reason in heterogeneity$summary$reasons) {
+      message(sprintf("    - %s", reason))
+    }
+  }
+
+  return(heterogeneity)
+}
+
+
+# ==============================================================================
+# BOOTSTRAP CONFIDENCE INTERVALS
+# ==============================================================================
+
+#' Bootstrap Pseudotime Confidence Intervals
+#'
+#' Computes bootstrap CIs for consensus pseudotime
+#'
+#' @param seurat_obj Seurat object
+#' @param methods Methods to use
+#' @param config Configuration list
+#' @param subtype_column Subtype column name
+#' @param root_subtype Root subtype
+#' @param reduction Reduction to use
+#' @param n_bootstrap Number of bootstrap iterations
+#' @param ci_level Confidence interval level (default 0.95)
+#' @param parallel Whether to run in parallel
+#' @return List with confidence intervals
+#' @export
+bootstrap_pseudotime_ci <- function(seurat_obj,
+                                    methods,
+                                    config = NULL,
+                                    subtype_column = "module_score_subtype",
+                                    root_subtype = "Basal-like",
+                                    reduction = "umap",
+                                    n_bootstrap = 100,
+                                    ci_level = 0.95,
+                                    parallel = TRUE) {
+
+  n_cells <- ncol(seurat_obj)
+  alpha <- 1 - ci_level
+
+  message(sprintf("  Running %d bootstrap iterations...", n_bootstrap))
+
+  # Function for single bootstrap iteration
+  run_bootstrap_iter <- function(iter) {
+    # Sample cells with replacement
+    boot_idx <- sample(1:n_cells, n_cells, replace = TRUE)
+    boot_cells <- colnames(seurat_obj)[boot_idx]
+
+    # Create bootstrap Seurat object
+    boot_seurat <- subset(seurat_obj, cells = unique(boot_cells))
+
+    # Run trajectory (lightweight - single method for speed)
+    tryCatch({
+      # Use fastest method for bootstrap
+      boot_result <- run_multi_method_trajectory(
+        boot_seurat,
+        config = config,
+        methods = methods[1],  # Use first method only for speed
+        subtype_column = subtype_column,
+        root_subtype = root_subtype,
+        n_cores = 1,
+        bootstrap_ci = FALSE
+      )
+
+      # Return pseudotime for original cells
+      pt <- boot_result$consensus$pseudotime
+      names(pt) <- colnames(boot_seurat)
+
+      # Map back to original cell indices
+      pt_full <- rep(NA, n_cells)
+      names(pt_full) <- colnames(seurat_obj)
+
+      # Average for cells that appear multiple times
+      for (cell in unique(boot_cells)) {
+        if (cell %in% names(pt)) {
+          pt_full[cell] <- pt[cell]
+        }
+      }
+
+      pt_full
+
+    }, error = function(e) {
+      rep(NA, n_cells)
+    })
+  }
+
+  # Run bootstrap iterations
+  backend <- get_parallel_backend()
+
+  if (parallel && backend$n_cores > 1 && requireNamespace("future.apply", quietly = TRUE)) {
+    message(sprintf("  Using %d cores for bootstrap...", backend$n_cores))
+
+    boot_results <- future.apply::future_lapply(
+      1:n_bootstrap,
+      run_bootstrap_iter,
+      future.seed = TRUE
+    )
+  } else {
+    boot_results <- lapply(1:n_bootstrap, function(i) {
+      if (i %% 10 == 0) message(sprintf("    Iteration %d/%d", i, n_bootstrap))
+      run_bootstrap_iter(i)
+    })
+  }
+
+  # Combine results into matrix
+  boot_matrix <- do.call(cbind, boot_results)
+  rownames(boot_matrix) <- colnames(seurat_obj)
+
+  # Calculate confidence intervals
+  ci_lower <- apply(boot_matrix, 1, quantile, probs = alpha/2, na.rm = TRUE)
+  ci_upper <- apply(boot_matrix, 1, quantile, probs = 1 - alpha/2, na.rm = TRUE)
+  ci_width <- ci_upper - ci_lower
+
+  # Calculate bootstrap standard error
+  boot_se <- apply(boot_matrix, 1, sd, na.rm = TRUE)
+
+  # Calculate number of successful iterations per cell
+  n_valid <- rowSums(!is.na(boot_matrix))
+
+  message(sprintf("  Mean CI width: %.3f", mean(ci_width, na.rm = TRUE)))
+  message(sprintf("  Mean bootstrap SE: %.3f", mean(boot_se, na.rm = TRUE)))
+
+  return(list(
+    ci_lower = ci_lower,
+    ci_upper = ci_upper,
+    ci_width = ci_width,
+    boot_se = boot_se,
+    n_valid = n_valid,
+    boot_matrix = boot_matrix,
+    ci_level = ci_level,
+    n_bootstrap = n_bootstrap
+  ))
+}
+
+
+# ==============================================================================
+# PERMUTATION SIGNIFICANCE TESTING
+# ==============================================================================
+
+#' Permutation Test for Trajectory Significance
+#'
+#' Tests whether the observed trajectory ordering is significantly different from random
+#'
+#' @param seurat_obj Seurat object with pseudotime
+#' @param subtype_column Column with subtypes
+#' @param expected_order Expected subtype ordering
+#' @param n_permutations Number of permutations
+#' @param parallel Whether to run in parallel
+#' @return List with permutation test results
+#' @export
+permutation_test_trajectory <- function(seurat_obj,
+                                        subtype_column = "module_score_subtype",
+                                        expected_order = NULL,
+                                        n_permutations = 1000,
+                                        parallel = TRUE) {
+
+  message("\n--- Permutation Test for Trajectory Significance ---")
+
+  pseudotime <- seurat_obj$pseudotime_consensus
+  subtypes <- seurat_obj@meta.data[[subtype_column]]
+
+  if (is.null(expected_order)) {
+    expected_order <- c("Basal-like", "Transit-Amplifying", "Intermediate", "Specialized")
+  }
+
+  # Calculate observed statistic
+  # Use Spearman correlation between mean pseudotime rank and expected rank
+  observed_mean_pt <- tapply(pseudotime, subtypes, mean, na.rm = TRUE)
+
+  # Filter to subtypes in expected order
+  common_subtypes <- intersect(names(observed_mean_pt), expected_order)
+
+  if (length(common_subtypes) < 3) {
+    warning("Too few common subtypes for permutation test")
+    return(list(
+      p_value = NA,
+      message = "Insufficient common subtypes"
+    ))
+  }
+
+  # Expected ranks
+  expected_ranks <- match(common_subtypes, expected_order)
+
+  # Observed correlation
+  observed_cor <- cor(rank(observed_mean_pt[common_subtypes]), expected_ranks,
+                      method = "spearman")
+
+  message(sprintf("  Observed correlation: %.3f", observed_cor))
+  message(sprintf("  Running %d permutations...", n_permutations))
+
+  # Permutation function
+  run_permutation <- function(i) {
+    # Permute pseudotime values
+    perm_pt <- sample(pseudotime)
+
+    # Calculate mean pseudotime by subtype
+    perm_mean_pt <- tapply(perm_pt, subtypes, mean, na.rm = TRUE)
+
+    # Calculate correlation with expected order
+    cor(rank(perm_mean_pt[common_subtypes]), expected_ranks, method = "spearman")
+  }
+
+  # Run permutations
+  backend <- get_parallel_backend()
+
+  if (parallel && backend$n_cores > 1 && requireNamespace("future.apply", quietly = TRUE)) {
+    perm_cors <- future.apply::future_sapply(
+      1:n_permutations,
+      run_permutation,
+      future.seed = TRUE
+    )
+  } else {
+    perm_cors <- sapply(1:n_permutations, run_permutation)
+  }
+
+  # Calculate p-value (one-tailed: observed should be higher than random)
+  p_value <- mean(perm_cors >= observed_cor)
+
+  # Also calculate two-tailed p-value
+  p_value_two_tailed <- mean(abs(perm_cors) >= abs(observed_cor))
+
+  message(sprintf("  P-value (one-tailed): %.4f", p_value))
+  message(sprintf("  P-value (two-tailed): %.4f", p_value_two_tailed))
+
+  # Effect size (how many SDs above random)
+  effect_size <- (observed_cor - mean(perm_cors)) / sd(perm_cors)
+  message(sprintf("  Effect size (Cohen's d): %.2f", effect_size))
+
+  return(list(
+    observed_correlation = observed_cor,
+    permutation_correlations = perm_cors,
+    p_value = p_value,
+    p_value_two_tailed = p_value_two_tailed,
+    effect_size = effect_size,
+    n_permutations = n_permutations,
+    significant = p_value < 0.05,
+    interpretation = ifelse(p_value < 0.001, "Highly significant trajectory",
+                            ifelse(p_value < 0.01, "Very significant trajectory",
+                                   ifelse(p_value < 0.05, "Significant trajectory",
+                                          "Non-significant trajectory")))
+  ))
+}
+
+
+#' Permutation Test for Method Concordance
+#'
+#' Tests whether method agreement is significantly better than chance
+#'
+#' @param pseudotime_matrix Matrix of pseudotime values (cells x methods)
+#' @param n_permutations Number of permutations
+#' @param parallel Whether to run in parallel
+#' @return List with permutation test results
+#' @export
+permutation_test_method_concordance <- function(pseudotime_matrix,
+                                                n_permutations = 1000,
+                                                parallel = TRUE) {
+
+  message("\n--- Permutation Test for Method Concordance ---")
+
+  n_methods <- ncol(pseudotime_matrix)
+
+  if (n_methods < 2) {
+    return(list(p_value = NA, message = "Need at least 2 methods"))
+  }
+
+  # Observed mean pairwise correlation
+  cor_matrix <- cor(pseudotime_matrix, method = "spearman", use = "pairwise.complete.obs")
+  observed_mean_cor <- mean(cor_matrix[upper.tri(cor_matrix)])
+
+  message(sprintf("  Observed mean correlation: %.3f", observed_mean_cor))
+
+  # Permutation function
+  run_permutation <- function(i) {
+    # Permute each method's pseudotime independently
+    perm_matrix <- apply(pseudotime_matrix, 2, sample)
+
+    # Calculate correlation
+    perm_cor <- cor(perm_matrix, method = "spearman", use = "pairwise.complete.obs")
+    mean(perm_cor[upper.tri(perm_cor)])
+  }
+
+  # Run permutations
+  backend <- get_parallel_backend()
+
+  if (parallel && backend$n_cores > 1 && requireNamespace("future.apply", quietly = TRUE)) {
+    perm_cors <- future.apply::future_sapply(
+      1:n_permutations,
+      run_permutation,
+      future.seed = TRUE
+    )
+  } else {
+    perm_cors <- sapply(1:n_permutations, run_permutation)
+  }
+
+  # Calculate p-value
+  p_value <- mean(perm_cors >= observed_mean_cor)
+
+  message(sprintf("  P-value: %.4f", p_value))
+
+  return(list(
+    observed_correlation = observed_mean_cor,
+    permutation_correlations = perm_cors,
+    p_value = p_value,
+    significant = p_value < 0.05,
+    n_permutations = n_permutations
+  ))
+}
+
+
+# ==============================================================================
+# TRAJECTORY VALIDATION
+# ==============================================================================
 
 #' Validate Trajectory Against Expected Order
 #'
@@ -859,6 +1670,524 @@ validate_trajectory_order <- function(results,
 }
 
 
+# ==============================================================================
+# COMPREHENSIVE STATISTICAL EVALUATION
+# ==============================================================================
+
+#' Evaluate Trajectory Analysis Statistics
+#'
+#' Computes comprehensive statistics to evaluate trajectory inference quality
+#'
+#' @param seurat_obj Seurat object with pseudotime
+#' @param results Results list from run_multi_method_trajectory
+#' @param config Configuration list
+#' @param differentiation_markers Named list of markers
+#' @param expected_order Expected order of subtypes
+#' @param run_permutation Whether to run permutation tests
+#' @param n_permutations Number of permutations
+#' @return List with statistical evaluation results
+#' @export
+evaluate_trajectory_statistics <- function(seurat_obj,
+                                           results,
+                                           config = NULL,
+                                           differentiation_markers = NULL,
+                                           expected_order = NULL,
+                                           run_permutation = TRUE,
+                                           n_permutations = 1000) {
+
+  message("\n========================================")
+  message("Trajectory Analysis Statistics")
+  message("========================================\n")
+
+  stats <- list()
+
+  # Get expected order from config if not provided
+  if (is.null(expected_order) && !is.null(config$trajectory$expected_order)) {
+    expected_order <- config$trajectory$expected_order
+  }
+
+  # Default differentiation markers if not provided
+  if (is.null(differentiation_markers)) {
+    differentiation_markers <- list(
+      early = c("SOX9", "KRT5", "KRT14", "TP63", "ITGA6", "ITGB1"),
+      late = c("KRT20", "MUC2", "FABP1", "SI", "ALPI", "VIL1")
+    )
+  }
+
+  # ===========================================================================
+  # 1. Method Agreement Statistics
+  # ===========================================================================
+  message("--- Method Agreement ---")
+
+  pt_matrix <- results$pseudotime_matrix
+  methods_used <- colnames(pt_matrix)[colSums(!is.na(pt_matrix)) > 0]
+  n_methods <- length(methods_used)
+
+  if (n_methods >= 2) {
+    # Pairwise Spearman correlations
+    cor_results <- list()
+    cor_matrix <- matrix(NA, nrow = n_methods, ncol = n_methods)
+    rownames(cor_matrix) <- colnames(cor_matrix) <- methods_used
+
+    for (i in 1:n_methods) {
+      for (j in 1:n_methods) {
+        if (i != j) {
+          rho <- cor(pt_matrix[, methods_used[i]], pt_matrix[, methods_used[j]],
+                     use = "pairwise.complete.obs", method = "spearman")
+          cor_matrix[i, j] <- rho
+
+          if (i < j) {
+            pair_name <- paste(methods_used[i], "vs", methods_used[j])
+            test <- cor.test(pt_matrix[, methods_used[i]], pt_matrix[, methods_used[j]],
+                             method = "spearman")
+
+            cor_results[[pair_name]] <- list(
+              rho = rho,
+              p_value = test$p.value,
+              n = sum(complete.cases(pt_matrix[, c(methods_used[i], methods_used[j])]))
+            )
+
+            message(sprintf("  %s: ρ = %.3f (p = %.2e)", pair_name, rho, test$p.value))
+          }
+        } else {
+          cor_matrix[i, j] <- 1
+        }
+      }
+    }
+
+    stats$method_correlations <- cor_results
+    stats$correlation_matrix <- cor_matrix
+    upper_tri <- cor_matrix[upper.tri(cor_matrix)]
+    stats$mean_correlation <- mean(upper_tri, na.rm = TRUE)
+    message(sprintf("  Mean pairwise correlation: ρ = %.3f", stats$mean_correlation))
+
+    # Permutation test for method concordance
+    if (run_permutation) {
+      concordance_perm <- permutation_test_method_concordance(
+        pt_matrix[, methods_used],
+        n_permutations = n_permutations,
+        parallel = get_parallel_backend()$n_cores > 1
+      )
+      stats$method_concordance_permutation <- concordance_perm
+    }
+
+  } else {
+    message("  Only one method - skipping agreement statistics")
+    stats$mean_correlation <- NA
+  }
+
+  # ===========================================================================
+  # 2. Per-Method Quality Scores
+  # ===========================================================================
+  message("\n--- Per-Method Quality ---")
+
+  if (!is.null(results$method_quality)) {
+    stats$method_quality <- results$method_quality
+
+    for (method in names(results$method_quality)) {
+      mq <- results$method_quality[[method]]
+      message(sprintf("  %s: overall=%.3f, separation=%.3f",
+                      method,
+                      mq$overall_quality,
+                      ifelse(is.null(mq$separation), NA, mq$separation)))
+    }
+  }
+
+  # ===========================================================================
+  # 3. Cell Cycle Confounding Assessment
+  # ===========================================================================
+  message("\n--- Cell Cycle Confounding ---")
+
+  has_cell_cycle <- "cc_consensus" %in% colnames(seurat_obj@meta.data) ||
+    "Phase" %in% colnames(seurat_obj@meta.data)
+
+  if (has_cell_cycle) {
+    pseudotime <- seurat_obj$pseudotime_consensus
+
+    phase_col <- ifelse("cc_consensus" %in% colnames(seurat_obj@meta.data),
+                        "cc_consensus", "Phase")
+
+    phase_numeric <- as.numeric(factor(seurat_obj@meta.data[[phase_col]],
+                                       levels = c("G1", "S", "G2M")))
+
+    cc_cor <- cor(pseudotime, phase_numeric,
+                  use = "pairwise.complete.obs", method = "spearman")
+    cc_test <- cor.test(pseudotime, phase_numeric, method = "spearman")
+
+    stats$cell_cycle_correlation <- list(
+      rho = cc_cor,
+      p_value = cc_test$p.value,
+      interpretation = ifelse(abs(cc_cor) > 0.3, "POTENTIAL CONFOUNDING", "LOW CONFOUNDING")
+    )
+
+    message(sprintf("  Pseudotime ~ Cell Cycle Phase: ρ = %.3f (p = %.2e)",
+                    cc_cor, cc_test$p.value))
+    message(sprintf("  Interpretation: %s", stats$cell_cycle_correlation$interpretation))
+
+    # Cycling percentage along trajectory
+    pt_bins <- cut(pseudotime, breaks = 5, labels = c("0-20%", "20-40%", "40-60%", "60-80%", "80-100%"))
+    cycling_by_bin <- tapply(seurat_obj@meta.data[[phase_col]] %in% c("S", "G2M"),
+                             pt_bins, mean, na.rm = TRUE) * 100
+
+    stats$cycling_along_trajectory <- data.frame(
+      pseudotime_bin = names(cycling_by_bin),
+      cycling_percent = as.numeric(cycling_by_bin)
+    )
+
+  } else {
+    message("  Cell cycle data not available - skipping")
+    stats$cell_cycle_correlation <- NULL
+  }
+
+  # ===========================================================================
+  # 4. Biological Validation - Marker Correlations
+  # ===========================================================================
+  message("\n--- Biological Validation (Marker Trends) ---")
+
+  pseudotime <- seurat_obj$pseudotime_consensus
+  available_early <- intersect(differentiation_markers$early, rownames(seurat_obj))
+  available_late <- intersect(differentiation_markers$late, rownames(seurat_obj))
+
+  message(sprintf("  Early markers available: %d/%d",
+                  length(available_early), length(differentiation_markers$early)))
+  message(sprintf("  Late markers available: %d/%d",
+                  length(available_late), length(differentiation_markers$late)))
+
+  if (length(available_early) > 0 || length(available_late) > 0) {
+    all_markers <- c(available_early, available_late)
+    expr_data <- as.matrix(Seurat::GetAssayData(seurat_obj, layer = "data")[all_markers, , drop = FALSE])
+
+    marker_results <- lapply(all_markers, function(marker) {
+      expected_direction <- ifelse(marker %in% available_early, "negative", "positive")
+
+      rho <- cor(pseudotime, expr_data[marker, ],
+                 use = "pairwise.complete.obs", method = "spearman")
+      test <- cor.test(pseudotime, expr_data[marker, ], method = "spearman")
+
+      correct_direction <- ifelse(expected_direction == "negative", rho < 0, rho > 0)
+
+      list(
+        marker = marker,
+        rho = rho,
+        p_value = test$p.value,
+        expected = expected_direction,
+        correct_direction = correct_direction,
+        significant = test$p.value < 0.05
+      )
+    })
+
+    marker_df <- do.call(rbind, lapply(marker_results, as.data.frame))
+    stats$marker_validation <- marker_df
+
+    n_correct <- sum(marker_df$correct_direction)
+    n_sig_correct <- sum(marker_df$correct_direction & marker_df$significant)
+    n_total <- nrow(marker_df)
+
+    stats$marker_validation_summary <- list(
+      n_correct_direction = n_correct,
+      n_significant_correct = n_sig_correct,
+      n_total = n_total,
+      percent_correct = n_correct / n_total * 100,
+      validated = n_sig_correct >= n_total / 2
+    )
+
+    message(sprintf("\n  Validation: %d/%d correct direction, %d significant",
+                    n_correct, n_total, n_sig_correct))
+  }
+
+  # ===========================================================================
+  # 5. Trajectory Order Validation
+  # ===========================================================================
+  message("\n--- Trajectory Order Validation ---")
+
+  if (!is.null(expected_order)) {
+    subtype_col <- ifelse("module_score_subtype" %in% colnames(seurat_obj@meta.data),
+                          "module_score_subtype", "subtype")
+    subtypes <- seurat_obj@meta.data[[subtype_col]]
+    mean_pt_by_subtype <- tapply(pseudotime, subtypes, mean, na.rm = TRUE)
+    observed_order <- names(sort(mean_pt_by_subtype))
+    observed_in_expected <- observed_order[observed_order %in% expected_order]
+    expected_filtered <- expected_order[expected_order %in% observed_order]
+
+    message(sprintf("  Expected order: %s", paste(expected_filtered, collapse = " → ")))
+    message(sprintf("  Observed order: %s", paste(observed_in_expected, collapse = " → ")))
+
+    if (length(observed_in_expected) >= 3) {
+      expected_ranks <- match(observed_in_expected, expected_filtered)
+      observed_ranks <- 1:length(observed_in_expected)
+      rank_cor <- cor(expected_ranks, observed_ranks, method = "spearman")
+
+      stats$order_validation <- list(
+        expected = expected_filtered,
+        observed = observed_in_expected,
+        rank_correlation = rank_cor,
+        order_preserved = rank_cor > 0.7
+      )
+
+      message(sprintf("  Rank correlation: ρ = %.3f", rank_cor))
+    }
+
+    stats$mean_pseudotime_by_subtype <- data.frame(
+      subtype = names(mean_pt_by_subtype),
+      mean_pseudotime = as.numeric(mean_pt_by_subtype),
+      sd_pseudotime = as.numeric(tapply(pseudotime, subtypes, sd, na.rm = TRUE)),
+      n_cells = as.numeric(table(subtypes)[names(mean_pt_by_subtype)])
+    )
+  }
+
+  # ===========================================================================
+  # 6. Permutation Test for Trajectory Significance
+  # ===========================================================================
+  if (run_permutation && !is.null(expected_order)) {
+    perm_test <- permutation_test_trajectory(
+      seurat_obj,
+      subtype_column = ifelse("module_score_subtype" %in% colnames(seurat_obj@meta.data),
+                              "module_score_subtype", "subtype"),
+      expected_order = expected_order,
+      n_permutations = n_permutations,
+      parallel = get_parallel_backend()$n_cores > 1
+    )
+    stats$permutation_test <- perm_test
+  }
+
+  # ===========================================================================
+  # 7. Bootstrap Results Summary (if available)
+  # ===========================================================================
+  if (!is.null(results$bootstrap)) {
+    message("\n--- Bootstrap Confidence Intervals ---")
+
+    stats$bootstrap_summary <- list(
+      mean_ci_width = mean(results$bootstrap$ci_width, na.rm = TRUE),
+      median_ci_width = median(results$bootstrap$ci_width, na.rm = TRUE),
+      mean_se = mean(results$bootstrap$boot_se, na.rm = TRUE),
+      coverage = mean(results$bootstrap$n_valid >= results$bootstrap$n_bootstrap * 0.9)
+    )
+
+    message(sprintf("  Mean CI width: %.3f", stats$bootstrap_summary$mean_ci_width))
+    message(sprintf("  Mean bootstrap SE: %.3f", stats$bootstrap_summary$mean_se))
+  }
+
+  # ===========================================================================
+  # 8. Overall Quality Score
+  # ===========================================================================
+  message("\n--- Overall Quality Score ---")
+
+  quality_components <- c()
+
+  if (!is.na(stats$mean_correlation)) {
+    agreement_score <- min(stats$mean_correlation / 0.7, 1)
+    quality_components["method_agreement"] <- agreement_score * 0.20
+  }
+
+  if (!is.null(stats$marker_validation_summary)) {
+    marker_score <- stats$marker_validation_summary$percent_correct / 100
+    quality_components["marker_validation"] <- marker_score * 0.25
+  }
+
+  if (!is.null(stats$order_validation)) {
+    order_score <- max(0, (stats$order_validation$rank_correlation + 1) / 2)
+    quality_components["order_preservation"] <- order_score * 0.20
+  }
+
+  if (!is.null(stats$cell_cycle_correlation)) {
+    cc_score <- 1 - min(abs(stats$cell_cycle_correlation$rho), 1)
+    quality_components["cell_cycle"] <- cc_score * 0.10
+  }
+
+  if (!is.null(stats$permutation_test)) {
+    perm_score <- ifelse(stats$permutation_test$p_value < 0.05, 1, 0.5)
+    quality_components["significance"] <- perm_score * 0.15
+  }
+
+  if (!is.null(results$consensus$confidence)) {
+    conf_score <- mean(results$consensus$confidence, na.rm = TRUE)
+    quality_components["confidence"] <- conf_score * 0.10
+  }
+
+  overall_score <- sum(quality_components, na.rm = TRUE)
+  max_possible <- sum(c(0.20, 0.25, 0.20, 0.10, 0.15, 0.10)[
+    c("method_agreement", "marker_validation", "order_preservation",
+      "cell_cycle", "significance", "confidence") %in% names(quality_components)
+  ])
+
+  if (max_possible > 0) {
+    overall_score <- overall_score / max_possible
+  }
+
+  stats$quality_score <- list(
+    components = quality_components,
+    overall = overall_score,
+    grade = ifelse(overall_score >= 0.8, "Excellent",
+                   ifelse(overall_score >= 0.6, "Good",
+                          ifelse(overall_score >= 0.4, "Acceptable", "Review Needed")))
+  )
+
+  message(sprintf("\n  Quality Score: %.2f / 1.00 (%s)", overall_score, stats$quality_score$grade))
+  message("  Components:")
+  for (comp in names(quality_components)) {
+    message(sprintf("    %s: %.3f", comp, quality_components[comp]))
+  }
+
+  message("\n========================================\n")
+
+  return(stats)
+}
+
+
+# ==============================================================================
+# REPORTING FUNCTIONS
+# ==============================================================================
+
+#' Generate Trajectory Statistics Report
+#'
+#' Creates a formatted markdown report
+#'
+#' @param stats_results Results from evaluate_trajectory_statistics
+#' @param output_path Path to save the report
+#' @return Character string with formatted report
+#' @export
+generate_trajectory_report <- function(stats_results, output_path = NULL) {
+
+  report <- c(
+    "# Trajectory Analysis Evaluation Report",
+    paste0("Generated: ", Sys.time()),
+    "",
+    "## Quality Score",
+    sprintf("**Overall: %.2f / 1.00 (%s)**",
+            stats_results$quality_score$overall,
+            stats_results$quality_score$grade),
+    ""
+  )
+
+  # Method agreement section
+  if (!is.null(stats_results$method_correlations)) {
+    report <- c(report, "## Method Agreement", "")
+    report <- c(report, "| Comparison | Spearman ρ | p-value |")
+    report <- c(report, "|------------|------------|---------|")
+
+    for (name in names(stats_results$method_correlations)) {
+      r <- stats_results$method_correlations[[name]]
+      report <- c(report, sprintf("| %s | %.3f | %.2e |", name, r$rho, r$p_value))
+    }
+    report <- c(report, "", sprintf("**Mean correlation: %.3f**", stats_results$mean_correlation), "")
+
+    # Add permutation test result if available
+    if (!is.null(stats_results$method_concordance_permutation)) {
+      perm <- stats_results$method_concordance_permutation
+      report <- c(report, sprintf("**Concordance permutation test: p = %.4f (%s)**",
+                                  perm$p_value,
+                                  ifelse(perm$significant, "significant", "not significant")), "")
+    }
+  }
+
+  # Per-method quality
+  if (!is.null(stats_results$method_quality)) {
+    report <- c(report, "## Per-Method Quality", "")
+    report <- c(report, "| Method | Overall Quality | Separation | Continuity |")
+    report <- c(report, "|--------|-----------------|------------|------------|")
+
+    for (method in names(stats_results$method_quality)) {
+      mq <- stats_results$method_quality[[method]]
+      report <- c(report, sprintf("| %s | %.3f | %.3f | %.3f |",
+                                  method,
+                                  mq$overall_quality,
+                                  ifelse(is.null(mq$separation), NA, mq$separation),
+                                  ifelse(is.null(mq$continuity), NA, mq$continuity)))
+    }
+    report <- c(report, "")
+  }
+
+  # Permutation test results
+  if (!is.null(stats_results$permutation_test)) {
+    perm <- stats_results$permutation_test
+    report <- c(report, "## Trajectory Significance (Permutation Test)", "",
+                sprintf("- Observed correlation: %.3f", perm$observed_correlation),
+                sprintf("- P-value: %.4f", perm$p_value),
+                sprintf("- Effect size (Cohen's d): %.2f", perm$effect_size),
+                sprintf("- Interpretation: **%s**", perm$interpretation), "")
+  }
+
+  # Cell cycle section
+  if (!is.null(stats_results$cell_cycle_correlation)) {
+    cc <- stats_results$cell_cycle_correlation
+    report <- c(report, "## Cell Cycle Confounding", "",
+                sprintf("- Pseudotime ~ Phase correlation: ρ = %.3f (p = %.2e)", cc$rho, cc$p_value),
+                sprintf("- Interpretation: **%s**", cc$interpretation), "")
+  }
+
+  # Marker validation
+  if (!is.null(stats_results$marker_validation)) {
+    report <- c(report, "## Biological Validation (Marker Trends)", "")
+    report <- c(report, "| Marker | Spearman ρ | p-value | Expected | Correct |")
+    report <- c(report, "|--------|------------|---------|----------|---------|")
+
+    mv <- stats_results$marker_validation
+    for (i in 1:nrow(mv)) {
+      report <- c(report, sprintf("| %s | %.3f | %.2e | %s | %s |",
+                                  mv$marker[i], mv$rho[i], mv$p_value[i],
+                                  mv$expected[i],
+                                  ifelse(mv$correct_direction[i], "✓", "✗")))
+    }
+
+    if (!is.null(stats_results$marker_validation_summary)) {
+      mvs <- stats_results$marker_validation_summary
+      report <- c(report, "",
+                  sprintf("**Summary:** %d/%d correct direction (%.1f%%), Validation: %s",
+                          mvs$n_correct_direction, mvs$n_total, mvs$percent_correct,
+                          ifelse(mvs$validated, "PASSED", "REVIEW NEEDED")), "")
+    }
+  }
+
+  # Order validation
+  if (!is.null(stats_results$order_validation)) {
+    ov <- stats_results$order_validation
+    report <- c(report, "## Trajectory Order Validation", "",
+                sprintf("- Expected: %s", paste(ov$expected, collapse = " → ")),
+                sprintf("- Observed: %s", paste(ov$observed, collapse = " → ")),
+                sprintf("- Rank correlation: ρ = %.3f", ov$rank_correlation),
+                sprintf("- Order preserved: **%s**", ifelse(ov$order_preserved, "YES", "NO")), "")
+  }
+
+  # Bootstrap summary
+  if (!is.null(stats_results$bootstrap_summary)) {
+    bs <- stats_results$bootstrap_summary
+    report <- c(report, "## Bootstrap Confidence Intervals", "",
+                sprintf("- Mean CI width: %.3f", bs$mean_ci_width),
+                sprintf("- Mean bootstrap SE: %.3f", bs$mean_se),
+                sprintf("- Coverage: %.1f%%", bs$coverage * 100), "")
+  }
+
+  # Pseudotime by subtype
+  if (!is.null(stats_results$mean_pseudotime_by_subtype)) {
+    report <- c(report, "## Mean Pseudotime by Subtype", "")
+    report <- c(report, "| Subtype | Mean PT | SD | N Cells |")
+    report <- c(report, "|---------|---------|-------|---------|")
+
+    pt <- stats_results$mean_pseudotime_by_subtype
+    pt <- pt[order(pt$mean_pseudotime), ]
+    for (i in 1:nrow(pt)) {
+      report <- c(report, sprintf("| %s | %.3f | %.3f | %d |",
+                                  pt$subtype[i], pt$mean_pseudotime[i],
+                                  pt$sd_pseudotime[i], pt$n_cells[i]))
+    }
+    report <- c(report, "")
+  }
+
+  report_text <- paste(report, collapse = "\n")
+
+  if (!is.null(output_path)) {
+    writeLines(report_text, output_path)
+    message(sprintf("Report saved to: %s", output_path))
+  }
+
+  return(report_text)
+}
+
+
+# ==============================================================================
+# VISUALIZATION FUNCTIONS
+# ==============================================================================
+
 #' Plot Multi-Method Trajectory Comparison
 #'
 #' Creates diagnostic plots comparing trajectory methods
@@ -956,571 +2285,12 @@ plot_trajectory_comparison <- function(results, config = NULL) {
 }
 
 
-# ==============================================================================
-# TRAJECTORY STATISTICAL EVALUATION
-# ==============================================================================
-
-#' Evaluate Trajectory Analysis Statistics
-#'
-#' Computes comprehensive statistics to evaluate trajectory inference quality,
-#' including method agreement, biological validation, and cell cycle assessment
-#'
-#' @param seurat_obj Seurat object with pseudotime and cell cycle scores
-#' @param results Results list from run_multi_method_trajectory
-#' @param config Configuration list (optional)
-#' @param differentiation_markers Named list of markers expected to change along trajectory
-#' @param expected_order Expected order of subtypes along trajectory
-#' @return List with statistical evaluation results
-#' @export
-evaluate_trajectory_statistics <- function(seurat_obj,
-                                           results,
-                                           config = NULL,
-                                           differentiation_markers = NULL,
-                                           expected_order = NULL) {
-
-  message("\n========================================")
-  message("Trajectory Analysis Statistics")
-  message("========================================\n")
-
-  stats <- list()
-
-  # Get expected order from config if not provided
-  if (is.null(expected_order) && !is.null(config$trajectory$expected_order)) {
-    expected_order <- config$trajectory$expected_order
-  }
-
-  # Default differentiation markers if not provided
-  if (is.null(differentiation_markers)) {
-    differentiation_markers <- list(
-      # Markers expected to DECREASE along differentiation (early/progenitor)
-      early = c("SOX9", "KRT5", "KRT14", "TP63", "ITGA6", "ITGB1"),
-      # Markers expected to INCREASE along differentiation (late/mature)
-      late = c("KRT20", "MUC2", "FABP1", "SI", "ALPI", "VIL1")
-    )
-  }
-
-  # ===========================================================================
-  # 1. Method Agreement Statistics
-  # ===========================================================================
-  message("--- Method Agreement ---")
-
-  pt_matrix <- results$pseudotime_matrix
-  methods_used <- colnames(pt_matrix)[colSums(!is.na(pt_matrix)) > 0]
-  n_methods <- length(methods_used)
-
-  if (n_methods >= 2) {
-    # Pairwise Spearman correlations
-    cor_results <- list()
-    cor_matrix <- matrix(NA, nrow = n_methods, ncol = n_methods)
-    rownames(cor_matrix) <- colnames(cor_matrix) <- methods_used
-
-    for (i in 1:n_methods) {
-      for (j in 1:n_methods) {
-        if (i != j) {
-          rho <- cor(pt_matrix[, methods_used[i]], pt_matrix[, methods_used[j]],
-                     use = "pairwise.complete.obs", method = "spearman")
-          cor_matrix[i, j] <- rho
-
-          if (i < j) {
-            pair_name <- paste(methods_used[i], "vs", methods_used[j])
-
-            # Statistical test
-            test <- cor.test(pt_matrix[, methods_used[i]], pt_matrix[, methods_used[j]],
-                             method = "spearman")
-
-            cor_results[[pair_name]] <- list(
-              rho = rho,
-              p_value = test$p.value,
-              n = sum(complete.cases(pt_matrix[, c(methods_used[i], methods_used[j])]))
-            )
-
-            message(sprintf("  %s: ρ = %.3f (p = %.2e)", pair_name, rho, test$p.value))
-          }
-        } else {
-          cor_matrix[i, j] <- 1
-        }
-      }
-    }
-
-    stats$method_correlations <- cor_results
-    stats$correlation_matrix <- cor_matrix
-
-    # Mean pairwise correlation
-    upper_tri <- cor_matrix[upper.tri(cor_matrix)]
-    stats$mean_correlation <- mean(upper_tri, na.rm = TRUE)
-    message(sprintf("  Mean pairwise correlation: ρ = %.3f", stats$mean_correlation))
-
-  } else {
-    message("  Only one method - skipping agreement statistics")
-    stats$mean_correlation <- NA
-  }
-
-  # ===========================================================================
-  # 2. Cell Cycle Confounding Assessment
-  # ===========================================================================
-  message("\n--- Cell Cycle Confounding ---")
-
-  has_cell_cycle <- "cc_consensus" %in% colnames(seurat_obj@meta.data)
-
-  if (has_cell_cycle) {
-    pseudotime <- seurat_obj$pseudotime_consensus
-
-    # Convert phase to numeric for correlation
-    phase_numeric <- as.numeric(factor(seurat_obj$cc_consensus,
-                                       levels = c("G1", "S", "G2M")))
-
-    # Correlation between pseudotime and cell cycle
-    cc_cor <- cor(pseudotime, phase_numeric,
-                  use = "pairwise.complete.obs", method = "spearman")
-    cc_test <- cor.test(pseudotime, phase_numeric, method = "spearman")
-
-    stats$cell_cycle_correlation <- list(
-      rho = cc_cor,
-      p_value = cc_test$p.value,
-      interpretation = ifelse(abs(cc_cor) > 0.3, "POTENTIAL CONFOUNDING", "LOW CONFOUNDING")
-    )
-
-    message(sprintf("  Pseudotime ~ Cell Cycle Phase: ρ = %.3f (p = %.2e)",
-                    cc_cor, cc_test$p.value))
-    message(sprintf("  Interpretation: %s", stats$cell_cycle_correlation$interpretation))
-
-    # Cycling percentage along trajectory
-    # Bin pseudotime into quintiles
-    pt_bins <- cut(pseudotime, breaks = 5, labels = c("0-20%", "20-40%", "40-60%", "60-80%", "80-100%"))
-
-    cycling_by_bin <- tapply(seurat_obj$cc_consensus %in% c("S", "G2M"), pt_bins, mean, na.rm = TRUE) * 100
-
-    stats$cycling_along_trajectory <- data.frame(
-      pseudotime_bin = names(cycling_by_bin),
-      cycling_percent = as.numeric(cycling_by_bin)
-    )
-
-    message("  Cycling cells (%) along trajectory:")
-    for (i in 1:length(cycling_by_bin)) {
-      message(sprintf("    %s: %.1f%%", names(cycling_by_bin)[i], cycling_by_bin[i]))
-    }
-
-    # Expected: cycling should decrease along differentiation
-    cycling_trend <- cor(1:5, cycling_by_bin, method = "spearman")
-    stats$cycling_trend <- cycling_trend
-
-    if (cycling_trend < -0.5) {
-      message("  ✓ Cycling decreases along trajectory (expected for differentiation)")
-    } else if (cycling_trend > 0.5) {
-      message("  ⚠ Cycling increases along trajectory (unexpected)")
-    } else {
-      message("  ~ No clear cycling trend along trajectory")
-    }
-
-    # Use cell cycle confidence
-    if ("cc_confidence" %in% colnames(seurat_obj@meta.data)) {
-      mean_cc_conf <- mean(seurat_obj$cc_confidence, na.rm = TRUE)
-      stats$cell_cycle_confidence <- mean_cc_conf
-      message(sprintf("  Mean cell cycle confidence: %.3f", mean_cc_conf))
-    }
-
-  } else {
-    message("  Cell cycle data not available - skipping")
-    stats$cell_cycle_correlation <- NULL
-  }
-
-  # ===========================================================================
-  # 3. Biological Validation - Marker Correlations
-  # ===========================================================================
-  message("\n--- Biological Validation (Marker Trends) ---")
-
-  pseudotime <- seurat_obj$pseudotime_consensus
-
-  # Check available markers
-  available_early <- intersect(differentiation_markers$early, rownames(seurat_obj))
-  available_late <- intersect(differentiation_markers$late, rownames(seurat_obj))
-
-  message(sprintf("  Early markers available: %d/%d",
-                  length(available_early), length(differentiation_markers$early)))
-  message(sprintf("  Late markers available: %d/%d",
-                  length(available_late), length(differentiation_markers$late)))
-
-  marker_results <- list()
-
-  if (length(available_early) > 0 || length(available_late) > 0) {
-    # Get expression data
-    all_markers <- c(available_early, available_late)
-    expr_data <- as.matrix(Seurat::GetAssayData(seurat_obj, layer = "data")[all_markers, , drop = FALSE])
-
-    # Test each marker
-    for (marker in all_markers) {
-      expected_direction <- ifelse(marker %in% available_early, "negative", "positive")
-
-      rho <- cor(pseudotime, expr_data[marker, ],
-                 use = "pairwise.complete.obs", method = "spearman")
-      test <- cor.test(pseudotime, expr_data[marker, ], method = "spearman")
-
-      # Check if direction matches expectation
-      if (expected_direction == "negative") {
-        correct_direction <- rho < 0
-      } else {
-        correct_direction <- rho > 0
-      }
-
-      marker_results[[marker]] <- list(
-        rho = rho,
-        p_value = test$p.value,
-        expected = expected_direction,
-        correct_direction = correct_direction,
-        significant = test$p.value < 0.05
-      )
-    }
-
-    # Summary
-    marker_df <- do.call(rbind, lapply(names(marker_results), function(m) {
-      data.frame(
-        marker = m,
-        rho = marker_results[[m]]$rho,
-        p_value = marker_results[[m]]$p_value,
-        expected = marker_results[[m]]$expected,
-        correct_direction = marker_results[[m]]$correct_direction,
-        significant = marker_results[[m]]$significant
-      )
-    }))
-
-    stats$marker_validation <- marker_df
-
-    # Print results
-    message("\n  Early markers (expected: negative correlation):")
-    for (marker in available_early) {
-      r <- marker_results[[marker]]
-      status <- ifelse(r$correct_direction & r$significant, "✓",
-                       ifelse(r$correct_direction, "~", "✗"))
-      message(sprintf("    %s %s: ρ = %.3f (p = %.2e)", status, marker, r$rho, r$p_value))
-    }
-
-    message("\n  Late markers (expected: positive correlation):")
-    for (marker in available_late) {
-      r <- marker_results[[marker]]
-      status <- ifelse(r$correct_direction & r$significant, "✓",
-                       ifelse(r$correct_direction, "~", "✗"))
-      message(sprintf("    %s %s: ρ = %.3f (p = %.2e)", status, marker, r$rho, r$p_value))
-    }
-
-    # Validation summary
-    n_correct <- sum(marker_df$correct_direction)
-    n_sig_correct <- sum(marker_df$correct_direction & marker_df$significant)
-    n_total <- nrow(marker_df)
-
-    stats$marker_validation_summary <- list(
-      n_correct_direction = n_correct,
-      n_significant_correct = n_sig_correct,
-      n_total = n_total,
-      percent_correct = n_correct / n_total * 100,
-      validated = n_sig_correct >= n_total / 2
-    )
-
-    message(sprintf("\n  Validation: %d/%d correct direction, %d significant",
-                    n_correct, n_total, n_sig_correct))
-    message(sprintf("  Biological validation: %s",
-                    ifelse(stats$marker_validation_summary$validated, "PASSED", "REVIEW NEEDED")))
-
-  } else {
-    message("  No differentiation markers found in dataset")
-    stats$marker_validation <- NULL
-  }
-
-  # ===========================================================================
-  # 4. Trajectory Order Validation
-  # ===========================================================================
-  message("\n--- Trajectory Order Validation ---")
-
-  if (!is.null(expected_order)) {
-    subtype_col <- ifelse("module_score_subtype" %in% colnames(seurat_obj@meta.data),
-                          "module_score_subtype", "subtype")
-
-    subtypes <- seurat_obj@meta.data[[subtype_col]]
-
-    # Calculate mean pseudotime per subtype
-    mean_pt_by_subtype <- tapply(pseudotime, subtypes, mean, na.rm = TRUE)
-
-    # Get observed order
-    observed_order <- names(sort(mean_pt_by_subtype))
-
-    # Filter to only subtypes in expected order
-    observed_in_expected <- observed_order[observed_order %in% expected_order]
-    expected_filtered <- expected_order[expected_order %in% observed_order]
-
-    message(sprintf("  Expected order: %s", paste(expected_filtered, collapse = " → ")))
-    message(sprintf("  Observed order: %s", paste(observed_in_expected, collapse = " → ")))
-
-    # Spearman correlation of ranks
-    if (length(observed_in_expected) >= 3) {
-      expected_ranks <- match(observed_in_expected, expected_filtered)
-      observed_ranks <- 1:length(observed_in_expected)
-
-      rank_cor <- cor(expected_ranks, observed_ranks, method = "spearman")
-
-      stats$order_validation <- list(
-        expected = expected_filtered,
-        observed = observed_in_expected,
-        rank_correlation = rank_cor,
-        order_preserved = rank_cor > 0.7
-      )
-
-      message(sprintf("  Rank correlation: ρ = %.3f", rank_cor))
-      message(sprintf("  Order preserved: %s", ifelse(rank_cor > 0.7, "YES", "NO")))
-    } else {
-      message("  Too few shared subtypes for order validation")
-      stats$order_validation <- NULL
-    }
-
-    # Mean pseudotime table
-    stats$mean_pseudotime_by_subtype <- data.frame(
-      subtype = names(mean_pt_by_subtype),
-      mean_pseudotime = as.numeric(mean_pt_by_subtype),
-      sd_pseudotime = as.numeric(tapply(pseudotime, subtypes, sd, na.rm = TRUE)),
-      n_cells = as.numeric(table(subtypes)[names(mean_pt_by_subtype)])
-    )
-    stats$mean_pseudotime_by_subtype <- stats$mean_pseudotime_by_subtype[
-      order(stats$mean_pseudotime_by_subtype$mean_pseudotime), ]
-
-  } else {
-    message("  No expected order provided - skipping")
-    stats$order_validation <- NULL
-  }
-
-  # ===========================================================================
-  # 5. Confidence and Uncertainty Statistics
-  # ===========================================================================
-  message("\n--- Confidence Statistics ---")
-
-  if ("pseudotime_confidence" %in% colnames(seurat_obj@meta.data)) {
-    conf <- seurat_obj$pseudotime_confidence
-
-    stats$confidence_stats <- list(
-      mean = mean(conf, na.rm = TRUE),
-      median = median(conf, na.rm = TRUE),
-      sd = sd(conf, na.rm = TRUE),
-      high_confidence_pct = mean(conf >= 0.7, na.rm = TRUE) * 100,
-      low_confidence_pct = mean(conf < 0.4, na.rm = TRUE) * 100
-    )
-
-    message(sprintf("  Mean confidence: %.3f ± %.3f",
-                    stats$confidence_stats$mean, stats$confidence_stats$sd))
-    message(sprintf("  High confidence (≥0.7): %.1f%%", stats$confidence_stats$high_confidence_pct))
-    message(sprintf("  Low confidence (<0.4): %.1f%%", stats$confidence_stats$low_confidence_pct))
-  }
-
-  # ===========================================================================
-  # 6. Per-Sample Concordance (if available)
-  # ===========================================================================
-  if (!is.null(results$per_sample) && !is.null(results$per_sample$concordance)) {
-    message("\n--- Per-Sample Concordance ---")
-
-    conc <- results$per_sample$concordance
-
-    # Mean off-diagonal correlation
-    if (is.matrix(conc) && nrow(conc) > 1) {
-      off_diag <- conc[upper.tri(conc)]
-      stats$sample_concordance <- list(
-        mean_correlation = mean(off_diag, na.rm = TRUE),
-        min_correlation = min(off_diag, na.rm = TRUE),
-        max_correlation = max(off_diag, na.rm = TRUE)
-      )
-
-      message(sprintf("  Mean cross-sample correlation: %.3f (range: %.3f - %.3f)",
-                      stats$sample_concordance$mean_correlation,
-                      stats$sample_concordance$min_correlation,
-                      stats$sample_concordance$max_correlation))
-    }
-  }
-
-  # ===========================================================================
-  # 7. Overall Quality Score
-  # ===========================================================================
-  message("\n--- Overall Quality Score ---")
-
-  quality_components <- c()
-
-  # Component 1: Method agreement (weight: 25%)
-  if (!is.na(stats$mean_correlation)) {
-    # Correlation of 0.7+ = max score
-    agreement_score <- min(stats$mean_correlation / 0.7, 1)
-    quality_components["method_agreement"] <- agreement_score * 0.25
-  }
-
-  # Component 2: Biological validation (weight: 30%)
-  if (!is.null(stats$marker_validation_summary)) {
-    marker_score <- stats$marker_validation_summary$percent_correct / 100
-    quality_components["marker_validation"] <- marker_score * 0.30
-  }
-
-  # Component 3: Order preservation (weight: 25%)
-  if (!is.null(stats$order_validation)) {
-    # Correlation > 0.7 = full score
-    order_score <- max(0, (stats$order_validation$rank_correlation + 1) / 2)
-    quality_components["order_preservation"] <- order_score * 0.25
-  }
-
-  # Component 4: Low cell cycle confounding (weight: 10%)
-  if (!is.null(stats$cell_cycle_correlation)) {
-    # Lower correlation = better (less confounding)
-    cc_score <- 1 - min(abs(stats$cell_cycle_correlation$rho), 1)
-    quality_components["cell_cycle"] <- cc_score * 0.10
-  }
-
-  # Component 5: Confidence (weight: 10%)
-  if (!is.null(stats$confidence_stats)) {
-    conf_score <- stats$confidence_stats$mean
-    quality_components["confidence"] <- conf_score * 0.10
-  }
-
-  overall_score <- sum(quality_components, na.rm = TRUE)
-
-  # Normalize to available components
-  max_possible <- sum(c(0.25, 0.30, 0.25, 0.10, 0.10)[!is.na(match(
-    c("method_agreement", "marker_validation", "order_preservation", "cell_cycle", "confidence"),
-    names(quality_components)
-  ))])
-
-  if (max_possible > 0) {
-    overall_score <- overall_score / max_possible
-  }
-
-  stats$quality_score <- list(
-    components = quality_components,
-    overall = overall_score,
-    grade = ifelse(overall_score >= 0.8, "Excellent",
-                   ifelse(overall_score >= 0.6, "Good",
-                          ifelse(overall_score >= 0.4, "Acceptable", "Review Needed")))
-  )
-
-  message(sprintf("\n  Quality Score: %.2f / 1.00 (%s)", overall_score, stats$quality_score$grade))
-  message("  Components:")
-  for (comp in names(quality_components)) {
-    message(sprintf("    %s: %.3f", comp, quality_components[comp]))
-  }
-
-  message("\n========================================\n")
-
-  return(stats)
-}
-
-
-#' Generate Trajectory Statistics Report
-#'
-#' Creates a formatted markdown report of trajectory analysis statistics
-#'
-#' @param stats_results Results from evaluate_trajectory_statistics
-#' @param output_path Path to save the report (optional)
-#' @return Character string with formatted report
-#' @export
-generate_trajectory_report <- function(stats_results, output_path = NULL) {
-
-  report <- c(
-    "# Trajectory Analysis Evaluation Report",
-    paste0("Generated: ", Sys.time()),
-    "",
-    "## Quality Score",
-    sprintf("**Overall: %.2f / 1.00 (%s)**",
-            stats_results$quality_score$overall,
-            stats_results$quality_score$grade),
-    ""
-  )
-
-  # Method agreement section
-  if (!is.null(stats_results$method_correlations)) {
-    report <- c(report, "## Method Agreement", "")
-    report <- c(report, "| Comparison | Spearman ρ | p-value |")
-    report <- c(report, "|------------|------------|---------|")
-
-    for (name in names(stats_results$method_correlations)) {
-      r <- stats_results$method_correlations[[name]]
-      report <- c(report, sprintf("| %s | %.3f | %.2e |", name, r$rho, r$p_value))
-    }
-    report <- c(report, "", sprintf("**Mean correlation: %.3f**", stats_results$mean_correlation), "")
-  }
-
-  # Cell cycle section
-  if (!is.null(stats_results$cell_cycle_correlation)) {
-    cc <- stats_results$cell_cycle_correlation
-    report <- c(report, "## Cell Cycle Confounding", "",
-                sprintf("- Pseudotime ~ Phase correlation: ρ = %.3f (p = %.2e)", cc$rho, cc$p_value),
-                sprintf("- Interpretation: **%s**", cc$interpretation), "")
-
-    if (!is.null(stats_results$cycling_along_trajectory)) {
-      report <- c(report, "### Cycling Cells Along Trajectory", "")
-      report <- c(report, "| Pseudotime Bin | % Cycling |")
-      report <- c(report, "|----------------|-----------|")
-      ct <- stats_results$cycling_along_trajectory
-      for (i in 1:nrow(ct)) {
-        report <- c(report, sprintf("| %s | %.1f%% |", ct$pseudotime_bin[i], ct$cycling_percent[i]))
-      }
-      report <- c(report, "")
-    }
-  }
-
-  # Marker validation
-  if (!is.null(stats_results$marker_validation)) {
-    report <- c(report, "## Biological Validation (Marker Trends)", "")
-    report <- c(report, "| Marker | Spearman ρ | p-value | Expected | Correct |")
-    report <- c(report, "|--------|------------|---------|----------|---------|")
-
-    mv <- stats_results$marker_validation
-    for (i in 1:nrow(mv)) {
-      report <- c(report, sprintf("| %s | %.3f | %.2e | %s | %s |",
-                                  mv$marker[i], mv$rho[i], mv$p_value[i],
-                                  mv$expected[i],
-                                  ifelse(mv$correct_direction[i], "✓", "✗")))
-    }
-
-    if (!is.null(stats_results$marker_validation_summary)) {
-      mvs <- stats_results$marker_validation_summary
-      report <- c(report, "",
-                  sprintf("**Summary:** %d/%d correct direction (%.1f%%), Validation: %s",
-                          mvs$n_correct_direction, mvs$n_total, mvs$percent_correct,
-                          ifelse(mvs$validated, "PASSED", "REVIEW NEEDED")), "")
-    }
-  }
-
-  # Order validation
-  if (!is.null(stats_results$order_validation)) {
-    ov <- stats_results$order_validation
-    report <- c(report, "## Trajectory Order Validation", "",
-                sprintf("- Expected: %s", paste(ov$expected, collapse = " → ")),
-                sprintf("- Observed: %s", paste(ov$observed, collapse = " → ")),
-                sprintf("- Rank correlation: ρ = %.3f", ov$rank_correlation),
-                sprintf("- Order preserved: **%s**", ifelse(ov$order_preserved, "YES", "NO")), "")
-  }
-
-  # Pseudotime by subtype
-  if (!is.null(stats_results$mean_pseudotime_by_subtype)) {
-    report <- c(report, "## Mean Pseudotime by Subtype", "")
-    report <- c(report, "| Subtype | Mean PT | SD | N Cells |")
-    report <- c(report, "|---------|---------|-------|---------|")
-
-    pt <- stats_results$mean_pseudotime_by_subtype
-    for (i in 1:nrow(pt)) {
-      report <- c(report, sprintf("| %s | %.3f | %.3f | %d |",
-                                  pt$subtype[i], pt$mean_pseudotime[i],
-                                  pt$sd_pseudotime[i], pt$n_cells[i]))
-    }
-    report <- c(report, "")
-  }
-
-  report_text <- paste(report, collapse = "\n")
-
-  if (!is.null(output_path)) {
-    writeLines(report_text, output_path)
-    message(sprintf("Report saved to: %s", output_path))
-  }
-
-  return(report_text)
-}
-
-
 #' Plot Cell Cycle Along Trajectory
 #'
 #' Visualizes the relationship between pseudotime and cell cycle
 #'
 #' @param seurat_obj Seurat object with pseudotime and cell cycle
-#' @param config Configuration list (optional)
+#' @param config Configuration list
 #' @return ggplot object
 #' @export
 plot_cell_cycle_trajectory <- function(seurat_obj, config = NULL) {
@@ -1528,9 +2298,13 @@ plot_cell_cycle_trajectory <- function(seurat_obj, config = NULL) {
   require(ggplot2)
   require(patchwork)
 
-  if (!"pseudotime_consensus" %in% colnames(seurat_obj@meta.data) ||
-      !"cc_consensus" %in% colnames(seurat_obj@meta.data)) {
-    stop("Requires both pseudotime_consensus and cc_consensus in metadata")
+  # Determine cell cycle column
+  cc_col <- ifelse("cc_consensus" %in% colnames(seurat_obj@meta.data),
+                   "cc_consensus", "Phase")
+
+  if (!cc_col %in% colnames(seurat_obj@meta.data) ||
+      !"pseudotime_consensus" %in% colnames(seurat_obj@meta.data)) {
+    stop("Requires both pseudotime_consensus and cell cycle in metadata")
   }
 
   # Get colors
@@ -1542,9 +2316,12 @@ plot_cell_cycle_trajectory <- function(seurat_obj, config = NULL) {
 
   plot_data <- data.frame(
     pseudotime = seurat_obj$pseudotime_consensus,
-    phase = seurat_obj$cc_consensus,
-    confidence = seurat_obj$cc_confidence
+    phase = seurat_obj@meta.data[[cc_col]]
   )
+
+  if ("pseudotime_confidence" %in% colnames(seurat_obj@meta.data)) {
+    plot_data$confidence <- seurat_obj$pseudotime_confidence
+  }
 
   # Plot 1: Pseudotime distribution by phase
   p1 <- ggplot(plot_data, aes(x = phase, y = pseudotime, fill = phase)) +
@@ -1581,7 +2358,7 @@ plot_cell_cycle_trajectory <- function(seurat_obj, config = NULL) {
     labs(title = "Proliferation Along Trajectory",
          x = "Pseudotime (normalized)", y = "% Cycling (S + G2M)")
 
-  # Plot 4: UMAP colored by cell cycle (if UMAP available)
+  # Plot 4: UMAP colored by cell cycle
   if ("umap" %in% tolower(names(seurat_obj@reductions))) {
     umap_coords <- Seurat::Embeddings(seurat_obj, "umap")
     plot_data$UMAP_1 <- umap_coords[, 1]
