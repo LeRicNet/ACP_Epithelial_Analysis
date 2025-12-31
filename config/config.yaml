@@ -26,7 +26,7 @@ paths:
   snrnaseq_processed: "data/external/GSE215932/GSE215932_snRNA_processed.rds"
   bulk_rnaseq: "data/external/OpenPBTA/bulk_rnaseq.rds"
   acp_scn_annotated: "data/raw/acp_scn_annotated.rds"
-  cellxgene_keratinocytes: "data/reference/cellxgene_skin_keratinocytes.rds"
+  cellxgene_reference: "data/reference/cellxgene_skin_keratinocytes.rds"
 
   # Processed data outputs
   processed_spatial: "data/processed/spatial_processed.rds"

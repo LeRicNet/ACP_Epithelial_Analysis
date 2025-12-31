@@ -19,6 +19,7 @@
 #   Rscript scripts/01_cell_type_annotation.R --dataset spatial        # Visium data
 #   Rscript scripts/01_cell_type_annotation.R --dataset snrnaseq       # snRNA-seq GSE data
 #   Rscript scripts/01_cell_type_annotation.R --dataset acp_scn        # ACP scRNA-seq data
+#   Rscript scripts/01_cell_type_annotation.R --dataset cellxgene        # cellxgene keratinocytes
 #
 # ==============================================================================
 
@@ -46,7 +47,7 @@ while (i <= length(args)) {
   }
 }
 
-valid_datasets <- c("spatial", "snrnaseq", "acp_scn", "merged")
+valid_datasets <- c("spatial", "snrnaseq", "acp_scn", "merged", "cellxgene")
 if (!dataset_type %in% valid_datasets) {
   stop(sprintf("Invalid --dataset value. Use one of: %s", paste(valid_datasets, collapse = ", ")))
 }
@@ -171,6 +172,40 @@ if (dataset_type == "spatial") {
   check_full_data <- FALSE
 
   message("Configured for merged ACP + GSE dataset")
+} else if (dataset_type == "cellxgene") {
+  # CELLxGENE skin keratinocyte reference dataset
+  # Check config first, then fall back to default path
+  if (!is.null(config$paths$cellxgene_reference)) {
+    input_path <- get_path(config, config$paths$cellxgene_reference)
+  } else {
+    # Try both possible filenames
+    rds_path <- get_path(config, "data/reference/cellxgene_skin_keratinocytes.rds")
+    alt_rds_path <- get_path(config, "data/reference/skin_reference_census.rds")
+
+    if (file.exists(rds_path)) {
+      input_path <- rds_path
+    } else if (file.exists(alt_rds_path)) {
+      input_path <- alt_rds_path
+    } else {
+      stop("CELLxGENE reference not found. Run: Rscript scripts/download_cellxgene_reference.R")
+    }
+  }
+  alt_path <- NULL
+  count_col <- "nCount_RNA"
+  feature_col <- "nFeature_RNA"
+  default_assay <- "RNA"
+
+  # All cells in CELLxGENE reference are already keratinocytes/epithelial
+  # Use cell_type column but accept all values (no filtering needed)
+  epi_column <- "cell_type"
+  epi_values <- c("keratinocyte", "basal cell of epidermis", "spinous cell of epidermis")
+  epi_is_boolean <- FALSE
+
+  # No need to check for full data - reference has complete gene counts
+  check_full_data <- FALSE
+
+  message("Configured for CELLxGENE skin keratinocyte reference")
+  message("  Note: All cells are epithelial - no filtering will be applied")
 }
 
 # ==============================================================================
@@ -280,7 +315,7 @@ if (!count_col %in% colnames(seurat_obj@meta.data)) {
 # ==============================================================================
 
 sample_col_candidates <- c("sample", "Sample", "sample_id", "Sample_ID",
-                           "orig.ident", "patient", "Patient", "donor", "Donor")
+                           "orig.ident", "patient", "Patient", "donor", "Donor", "donor_id")
 sample_col <- NULL
 for (col in sample_col_candidates) {
   if (col %in% colnames(seurat_obj@meta.data)) {

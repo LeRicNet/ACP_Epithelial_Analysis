@@ -466,3 +466,9 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file.
 
 - **Corresponding Author**: [email]
 - **Issues**: Please use GitHub Issues for bug reports and questions
+
+# TODO:
+
+- add comment about
+chmod +x scripts/setup_python.sh
+./scripts/setup_python.sh
