@@ -35,3 +35,6 @@ if (interactive()) {
   message("  Type: source('scripts/generate_figures.R') to regenerate figures")
   message("\n")
 }
+
+# Python environment for reticulate
+Sys.setenv(RETICULATE_PYTHON = "/home/rstudio/interfaces/ACP_Epithelial_Analysis/.venv/bin/python")

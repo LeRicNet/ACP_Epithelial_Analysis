@@ -1,256 +1,302 @@
 #!/usr/bin/env Rscript
 # ==============================================================================
-# scripts/00_run_full_pipeline.R
+# 00_run_full_pipeline.R
 # ==============================================================================
-# Master script to run the complete ACP epithelial analysis pipeline
-# 
+# Master script to run the complete ACP Epithelial Differentiation Analysis
+# pipeline. Orchestrates all steps from data preparation through trajectory
+# analysis and figure generation.
+#
 # Usage:
 #   Rscript scripts/00_run_full_pipeline.R
-#   Or source in RStudio: source("scripts/00_run_full_pipeline.R")
+#   Rscript scripts/00_run_full_pipeline.R --dataset merged --skip-reference
+#   Rscript scripts/00_run_full_pipeline.R --help
 #
-# This script:
-#   1. Loads configuration
-#   2. Loads and preprocesses data
-#   3. Runs module score classification
-#   4. Runs trajectory analysis
-#   5. Generates all figures
-#   6. Saves results
+# Steps:
+#   0a. Download reference data (optional, one-time)
+#   0.  Merge datasets (if using merged analysis)
+#   1.  Cell type annotation
+#   1b. Reference validation and enhanced statistics
+#   2.  Trajectory analysis
+#   3.  Figure generation
+#
+# Author: [Your Name]
+# Date: 2025-12-30
 # ==============================================================================
 
-# Set working directory to project root
-if (interactive()) {
-  # In RStudio, use here package
-  setwd(here::here())
-} else {
-  # From command line, find project root
-  script_dir <- dirname(sys.frame(1)$ofile)
-  setwd(file.path(script_dir, ".."))
-}
+# --- Setup --------------------------------------------------------------------
 
-message("\n")
-message("================================================================")
-message("  ACP Epithelial Differentiation Analysis Pipeline")
-message("================================================================")
-message(paste("  Started:", Sys.time()))
-message(paste("  Working directory:", getwd()))
-message("\n")
-
-# ==============================================================================
-# SETUP
-# ==============================================================================
-
-# Load required packages
 suppressPackageStartupMessages({
-  library(Seurat)
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-  library(patchwork)
-  library(yaml)
+  library(optparse)
 })
 
-# Source all R functions
-message("Loading project functions...")
-source("R/utils/config.R")
-source("R/classification/module_score_classification.R")
-source("R/trajectory/trajectory_analysis.R")
-source("R/figures/figure_generators.R")
+# --- Command Line Arguments ---------------------------------------------------
 
-# Load configuration
-config <- load_config()
-print_config_summary(config)
+option_list <- list(
+  make_option(c("-d", "--dataset"), type = "character", default = "merged",
+              help = "Dataset to analyze: spatial, snrnaseq, acp_scn, merged [default: %default]"),
+  make_option(c("-c", "--config"), type = "character", default = "config/config.yaml",
+              help = "Path to configuration file [default: %default]"),
+  make_option(c("--cores"), type = "integer", default = NULL,
+              help = "Number of cores for parallel processing [default: auto-detect]"),
+  make_option(c("--skip-reference"), action = "store_true", default = FALSE,
+              help = "Skip reference data download"),
+  make_option(c("--skip-merge"), action = "store_true", default = FALSE,
+              help = "Skip dataset merging (use existing merged file)"),
+  make_option(c("--skip-validation"), action = "store_true", default = FALSE,
+              help = "Skip reference validation step"),
+  make_option(c("--skip-trajectory"), action = "store_true", default = FALSE,
+              help = "Skip trajectory analysis"),
+  make_option(c("--skip-figures"), action = "store_true", default = FALSE,
+              help = "Skip figure generation"),
+  make_option(c("--integrate"), action = "store_true", default = FALSE,
+              help = "Use Seurat integration for batch correction when merging"),
+  make_option(c("--reference-only"), action = "store_true", default = FALSE,
+              help = "Only download reference data, then stop"),
+  make_option(c("--dry-run"), action = "store_true", default = FALSE,
+              help = "Print steps without executing"),
+  make_option(c("-v", "--verbose"), action = "store_true", default = TRUE,
+              help = "Print detailed progress messages")
+)
 
-# ==============================================================================
-# STEP 1: LOAD DATA
-# ==============================================================================
+opt_parser <- OptionParser(option_list = option_list,
+                           description = "Run the complete ACP Epithelial Differentiation Analysis pipeline")
+opt <- parse_args(opt_parser)
 
-message("\n========================================")
-message("Step 1: Loading Data")
-message("========================================\n")
+# --- Helper Functions ---------------------------------------------------------
 
-# Check for data file
-data_path <- get_path(config, config$paths$spatial_object_with_subtypes)
-
-if (!file.exists(data_path)) {
-  # Try alternative path
-  data_path <- get_path(config, config$paths$spatial_object)
+log_step <- function(step_num, step_name, status = "START") {
+  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  if (status == "START") {
+    cat("\n")
+    cat(strrep("=", 70), "\n")
+    cat(sprintf("[%s] STEP %s: %s\n", timestamp, step_num, step_name))
+    cat(strrep("=", 70), "\n")
+  } else if (status == "DONE") {
+    cat(sprintf("[%s] STEP %s: %s - COMPLETED\n", timestamp, step_num, step_name))
+  } else if (status == "SKIP")
+    cat(sprintf("[%s] STEP %s: %s - SKIPPED\n", timestamp, step_num, step_name))
 }
 
-if (!file.exists(data_path)) {
-  stop(paste("Data file not found:", data_path, 
-             "\nPlease update paths in config/config.yaml"))
+run_script <- function(script_path, args = character(), dry_run = FALSE) {
+  cmd <- paste("Rscript", script_path, paste(args, collapse = " "))
+
+  if (dry_run) {
+    cat("  [DRY RUN] Would execute:", cmd, "\n")
+    return(0)
+  }
+
+  cat("  Executing:", cmd, "\n\n")
+  result <- system(cmd)
+
+  if (result != 0) {
+    stop(sprintf("Script failed with exit code %d: %s", result, script_path))
+  }
+
+  return(result)
 }
 
-message(paste("Loading data from:", data_path))
-seurat_obj <- readRDS(data_path)
-
-message(sprintf("Loaded %d cells with %d genes", ncol(seurat_obj), nrow(seurat_obj)))
-
-# Basic QC info
-if ("sample" %in% colnames(seurat_obj@meta.data)) {
-  message("Samples:")
-  print(table(seurat_obj$sample))
+check_file_exists <- function(filepath, description) {
+  if (!file.exists(filepath)) {
+    warning(sprintf("%s not found: %s", description, filepath))
+    return(FALSE)
+  }
+  return(TRUE)
 }
 
-# ==============================================================================
-# STEP 2: CLASSIFICATION
-# ==============================================================================
+# --- Print Configuration ------------------------------------------------------
 
-message("\n========================================")
-message("Step 2: Module Score Classification")
-message("========================================\n")
+cat("\n")
+cat(strrep("#", 70), "\n")
+cat("#  ACP Epithelial Differentiation Analysis - Full Pipeline\n")
+cat(strrep("#", 70), "\n")
+cat("\nConfiguration:\n")
+cat("  Dataset:          ", opt$dataset, "\n")
+cat("  Config file:      ", opt$config, "\n")
+cat("  Cores:            ", ifelse(is.null(opt$cores), "auto-detect", opt$cores), "\n")
+cat("  Skip reference:   ", opt$`skip-reference`, "\n
+")
+cat("  Skip merge:       ", opt$`skip-merge`, "\n")
+cat("  Skip validation:  ", opt$`skip-validation`, "\n")
+cat("  Skip trajectory:  ", opt$`skip-trajectory`, "\n")
+cat("  Skip figures:     ", opt$`skip-figures`, "\n")
+cat("  Integration:      ", opt$integrate, "\n")
+cat("  Dry run:          ", opt$`dry-run`, "\n")
+cat("\n")
 
-# Run classification pipeline
-seurat_obj <- run_classification_pipeline(seurat_obj, config, 
-                                          compare_with_binary = TRUE)
+# --- Determine Script Directory -----------------------------------------------
 
-# Save intermediate result
-ensure_dir(get_path(config, config$paths$objects_dir))
-saveRDS(seurat_obj, 
-        file.path(get_path(config, config$paths$objects_dir), 
-                  "seurat_classified.rds"))
-message("Saved classified object")
+# Find scripts relative to this file or use default
+script_dir <- "scripts"
+if (!dir.exists(script_dir)) {
+  # Try relative to current working directory
+  if (dir.exists("../scripts")) {
+    script_dir <- "../scripts"
+  } else {
+    stop("Cannot find scripts directory. Run from project root.")
+  }
+}
 
-# ==============================================================================
-# STEP 3: TRAJECTORY ANALYSIS
-# ==============================================================================
+# --- Step 0a: Download Reference Data -----------------------------------------
 
-message("\n========================================")
-message("Step 3: Trajectory Analysis")
-message("========================================\n")
+if (!opt$`skip-reference`) {
+  log_step("0a", "Download Reference Data")
 
-# Check if we have enough cells for trajectory
-n_epi <- sum(seurat_obj$module_score_subtype != "Non-epithelial", na.rm = TRUE)
-message(sprintf("Epithelial cells for trajectory: %d", n_epi))
+  ref_script <- file.path(script_dir, "00a_download_skin_reference.R")
+  ref_output <- "data/reference/skin_reference_census.rds"
 
-if (n_epi >= 100) {
-  
-  # Subset to epithelial cells
-  seurat_epi <- subset(seurat_obj, 
-                       module_score_subtype != "Non-epithelial" & 
-                       !is.na(module_score_subtype))
-  
-  # Run pooled trajectory
-  message("\n--- Pooled Analysis ---")
-  cds_pooled <- tryCatch({
-    run_trajectory_analysis(seurat_epi, config, "module_score_subtype")
-  }, error = function(e) {
-    message(paste("ERROR in pooled trajectory:", e$message))
-    NULL
-  })
-  
-  # Run per-sample trajectory if sample column exists
-  trajectory_results <- list()
-  
-  if (!is.null(cds_pooled)) {
-    trajectory_results$pooled <- list(
-      cds = cds_pooled,
-      skipped = FALSE
+  if (file.exists(ref_output) && !opt$`dry-run`) {
+    cat("  Reference data already exists:", ref_output, "\n")
+    cat("  Skipping download. Delete file to re-download.\n")
+    log_step("0a", "Download Reference Data", "SKIP")
+  } else if (check_file_exists(ref_script, "Reference download script")) {
+    ref_args <- c(
+      "--cell_type", "keratinocyte",
+      "--max_cells", "50000",
+      "--assay", "10x",
+      "--output_dir", "data/reference"
     )
+    run_script(ref_script, ref_args, opt$`dry-run`)
+    log_step("0a", "Download Reference Data", "DONE")
   }
-  
-  if ("sample" %in% colnames(seurat_epi@meta.data)) {
-    message("\n--- Per-Sample Analysis ---")
-    per_sample_results <- tryCatch({
-      run_per_sample_trajectory(seurat_epi, config, "sample", "module_score_subtype")
-    }, error = function(e) {
-      message(paste("ERROR in per-sample trajectory:", e$message))
-      NULL
-    })
-    
-    if (!is.null(per_sample_results)) {
-      trajectory_results <- c(trajectory_results, per_sample_results)
-    }
+
+  if (opt$`reference-only`) {
+    cat("\n--reference-only flag set. Stopping after reference download.\n")
+    quit(status = 0)
   }
-  
-  # Validate ordering
-  if (length(trajectory_results) > 0) {
-    expected_order <- c("Basal-like", "Transit-Amplifying", "Intermediate", "Specialized")
-    validation <- validate_trajectory_ordering(trajectory_results, expected_order, config)
-    
-    # Save validation results
-    save_table(validation, "trajectory_validation", config)
-  }
-  
-  # Save trajectory results
-  saveRDS(trajectory_results,
-          file.path(get_path(config, config$paths$objects_dir),
-                    "trajectory_results.rds"))
-  message("Saved trajectory results")
-  
 } else {
-  message("Insufficient epithelial cells for trajectory analysis")
-  trajectory_results <- NULL
+  log_step("0a", "Download Reference Data", "SKIP")
 }
 
-# ==============================================================================
-# STEP 4: GENERATE FIGURES
-# ==============================================================================
+# --- Step 0: Merge Datasets ---------------------------------------------------
 
-message("\n========================================")
-message("Step 4: Generating Figures")
-message("========================================\n")
+if (opt$dataset == "merged" && !opt$`skip-merge`) {
+  log_step("0", "Merge Datasets")
 
-if (!is.null(trajectory_results)) {
-  figure_paths <- generate_all_figures(seurat_obj, trajectory_results, config)
-  
-  message("\nGenerated figures:")
-  for (name in names(figure_paths)) {
-    message(sprintf("  %s: %s", name, figure_paths[[name]][1]))
+  merge_script <- file.path(script_dir, "00_merge_datasets.R")
+  merge_output <- "data/processed/merged_acp_gse.rds"
+
+  if (file.exists(merge_output) && !opt$`dry-run`) {
+    cat("  Merged dataset already exists:", merge_output, "\n")
+    cat("  Skipping merge. Delete file to re-merge.\n")
+    log_step("0", "Merge Datasets", "SKIP")
+  } else if (check_file_exists(merge_script, "Merge script")) {
+    merge_args <- c("--config", opt$config)
+    if (opt$integrate) {
+      merge_args <- c(merge_args, "--integrate")
+    }
+    run_script(merge_script, merge_args, opt$`dry-run`)
+    log_step("0", "Merge Datasets", "DONE")
   }
+} else if (opt$dataset == "merged") {
+  log_step("0", "Merge Datasets", "SKIP")
 }
 
-# ==============================================================================
-# STEP 5: SAVE FINAL RESULTS
-# ==============================================================================
+# --- Step 1: Cell Type Annotation ---------------------------------------------
 
-message("\n========================================")
-message("Step 5: Saving Results")
-message("========================================\n")
+log_step("1", "Cell Type Annotation")
 
-# Classification summary table
-class_summary <- seurat_obj@meta.data %>%
-  group_by(module_score_subtype) %>%
-  summarise(
-    n_cells = n(),
-    pct = n() / nrow(seurat_obj@meta.data) * 100,
-    mean_UMI = mean(nCount_Spatial, na.rm = TRUE),
-    mean_genes = mean(nFeature_Spatial, na.rm = TRUE)
-  ) %>%
-  arrange(desc(n_cells))
-
-save_table(class_summary, "classification_summary", config)
-
-# Pseudotime summary if available
-if (!is.null(trajectory_results) && !is.null(trajectory_results$pooled)) {
-  pt_summary <- summarize_pseudotime(trajectory_results$pooled$cds)
-  
-  pt_stats <- pt_summary %>%
-    group_by(subtype) %>%
-    summarise(
-      n = n(),
-      mean_pseudotime = mean(pseudotime, na.rm = TRUE),
-      sd_pseudotime = sd(pseudotime, na.rm = TRUE),
-      median_pseudotime = median(pseudotime, na.rm = TRUE)
-    ) %>%
-    arrange(mean_pseudotime)
-  
-  save_table(pt_stats, "pseudotime_summary", config)
+annotation_script <- file.path(script_dir, "01_cell_type_annotation.R")
+# Try v2 first, fall back to original
+if (!file.exists(annotation_script)) {
+  annotation_script <- file.path(script_dir, "01_cell_type_annotation_v2.R")
 }
 
-# Save session info for reproducibility
-session_info <- sessionInfo()
-saveRDS(session_info, 
-        file.path(get_path(config, config$paths$objects_dir), "session_info.rds"))
+if (check_file_exists(annotation_script, "Annotation script")) {
+  annotation_args <- c(
+    "--dataset", opt$dataset,
+    "--config", opt$config
+  )
+  run_script(annotation_script, annotation_args, opt$`dry-run`)
+  log_step("1", "Cell Type Annotation", "DONE")
+}
 
-# ==============================================================================
-# DONE
-# ==============================================================================
+# --- Step 1b: Reference Validation --------------------------------------------
 
-message("\n")
-message("================================================================")
-message("  Pipeline Complete!")
-message("================================================================")
-message(paste("  Finished:", Sys.time()))
-message(paste("  Results saved to:", get_path(config, "results")))
-message("\n")
+if (!opt$`skip-validation`) {
+  log_step("1b", "Reference Validation & Enhanced Statistics")
+
+  validation_script <- file.path(script_dir, "01b_reference_validation_enhanced_stats.R")
+  ref_file <- "data/reference/skin_reference_census.rds"
+
+  if (check_file_exists(validation_script, "Validation script")) {
+    validation_args <- c(
+      "--dataset", opt$dataset,
+      "--config", opt$config
+    )
+
+    # Add reference path if available
+    if (file.exists(ref_file)) {
+      validation_args <- c(validation_args,
+                           "--reference", "custom",
+                           "--ref_path", ref_file)
+    } else {
+      validation_args <- c(validation_args, "--reference", "signatures")
+      cat("  Note: Using signature-based validation (reference file not found)\n")
+    }
+
+    run_script(validation_script, validation_args, opt$`dry-run`)
+    log_step("1b", "Reference Validation & Enhanced Statistics", "DONE")
+  }
+} else {
+  log_step("1b", "Reference Validation & Enhanced Statistics", "SKIP")
+}
+
+# --- Step 2: Trajectory Analysis ----------------------------------------------
+
+if (!opt$`skip-trajectory`) {
+  log_step("2", "Trajectory Analysis")
+
+  trajectory_script <- file.path(script_dir, "02_trajectory_analysis.R")
+
+  if (check_file_exists(trajectory_script, "Trajectory script")) {
+    trajectory_args <- c(
+      "--dataset", opt$dataset,
+      "--config", opt$config
+    )
+    if (!is.null(opt$cores)) {
+      trajectory_args <- c(trajectory_args, "--cores", opt$cores)
+    }
+    run_script(trajectory_script, trajectory_args, opt$`dry-run`)
+    log_step("2", "Trajectory Analysis", "DONE")
+  }
+} else {
+  log_step("2", "Trajectory Analysis", "SKIP")
+}
+
+# --- Step 3: Figure Generation ------------------------------------------------
+
+if (!opt$`skip-figures`) {
+  log_step("3", "Figure Generation")
+
+  figures_script <- file.path(script_dir, "generate_figures.R")
+
+  if (check_file_exists(figures_script, "Figure generation script")) {
+    figures_args <- c("--config", opt$config)
+    run_script(figures_script, figures_args, opt$`dry-run`)
+    log_step("3", "Figure Generation", "DONE")
+  } else {
+    cat("  Figure generation script not found. Skipping.\n")
+    log_step("3", "Figure Generation", "SKIP")
+  }
+} else {
+  log_step("3", "Figure Generation", "SKIP")
+}
+
+# --- Summary ------------------------------------------------------------------
+
+cat("\n")
+cat(strrep("=", 70), "\n")
+cat("PIPELINE COMPLETE\n")
+cat(strrep("=", 70), "\n")
+cat("\nOutput locations:\n")
+cat("  Annotated cells:    results/objects/01_seurat_annotated_", opt$dataset, ".rds\n", sep = "")
+cat("  Validated cells:    results/objects/01b_seurat_validated_", opt$dataset, ".rds\n", sep = "")
+cat("  Trajectory:         results/objects/02_seurat_with_pseudotime_", opt$dataset, ".rds\n", sep = "")
+cat("  Tables:             results/tables/\n")
+cat("  Figures:            results/figures/main/\n")
+cat("                      results/figures/supplementary/\n")
+cat("\nReference data:       data/reference/\n")
+cat("\n")
+
+# Record completion time
+cat("Completed at:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
