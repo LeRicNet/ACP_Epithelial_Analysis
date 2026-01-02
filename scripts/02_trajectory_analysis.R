@@ -32,10 +32,15 @@
 #   - Comprehensive diagnostic plots
 #
 # Usage:
-#   Rscript scripts/02_trajectory_analysis.R
+#   Rscript scripts/02_trajectory_analysis.R                           # Default: spatial
+#   Rscript scripts/02_trajectory_analysis.R --dataset spatial         # Visium data
+#   Rscript scripts/02_trajectory_analysis.R --dataset snrnaseq        # snRNA-seq GSE data
+#   Rscript scripts/02_trajectory_analysis.R --dataset acp_scn         # ACP scRNA-seq data
+#   Rscript scripts/02_trajectory_analysis.R --dataset merged          # Merged dataset
+#   Rscript scripts/02_trajectory_analysis.R --dataset cellxgene       # CELLxGENE keratinocytes
 #   Rscript scripts/02_trajectory_analysis.R --config path/to/config.yaml
 #   Rscript scripts/02_trajectory_analysis.R --cores 16
-#   Rscript scripts/02_trajectory_analysis.R --no-bootstrap  # Skip bootstrap (faster)
+#   Rscript scripts/02_trajectory_analysis.R --no-bootstrap            # Skip bootstrap (faster)
 #
 # ==============================================================================
 
@@ -43,12 +48,13 @@
 # SETUP AND ARGUMENT PARSING
 # ==============================================================================
 
-# Increase memory limit for parallel processing
-options(future.globals.maxSize = 4 * 1024^3)  # 4 GiB
+# Increase memory limit for parallel processing (20 GiB for large datasets)
+options(future.globals.maxSize = 20 * 1024^3)  # 20 GiB
 
 # Parse command line arguments
 args <- commandArgs(trailingOnly = TRUE)
 config_path <- NULL
+dataset_type <- "spatial"
 n_cores_override <- NULL
 skip_bootstrap <- FALSE
 skip_permutation <- FALSE
@@ -59,6 +65,9 @@ i <- 1
 while (i <= length(args)) {
   if (args[i] == "--config" && i < length(args)) {
     config_path <- args[i + 1]
+    i <- i + 2
+  } else if (args[i] == "--dataset" && i < length(args)) {
+    dataset_type <- tolower(args[i + 1])
     i <- i + 2
   } else if (args[i] == "--cores" && i < length(args)) {
     n_cores_override <- as.integer(args[i + 1])
@@ -83,6 +92,13 @@ while (i <= length(args)) {
   }
 }
 
+# Validate dataset argument
+valid_datasets <- c("spatial", "snrnaseq", "acp_scn", "merged", "cellxgene")
+if (!dataset_type %in% valid_datasets) {
+  stop(sprintf("Invalid --dataset value '%s'. Use one of: %s",
+               dataset_type, paste(valid_datasets, collapse = ", ")))
+}
+
 # Find project root
 find_project_root <- function() {
   if (file.exists("config/config.yaml")) return(getwd())
@@ -103,13 +119,15 @@ find_project_root <- function() {
 
 project_root <- find_project_root()
 if (is.null(project_root)) {
-  stop("Could not find project root directory")
+  stop("Could not find project root directory.\n",
+       "Please run this script from the project root or scripts/ directory.")
 }
 setwd(project_root)
 
 message("\n")
 message("================================================================")
 message("  Step 2: Multi-Method Trajectory Analysis")
+message(sprintf("  Dataset type: %s", toupper(dataset_type)))
 message("  With HPC Parallelization & Comprehensive Statistics")
 message("================================================================")
 message(paste("  Started:", Sys.time()))
@@ -191,12 +209,13 @@ message("\n========================================")
 message("Loading Annotated Data")
 message("========================================\n")
 
-# Load from Step 1
-input_path <- file.path(get_path(config, config$paths$objects_dir), "01_seurat_annotated.rds")
+# Load from Step 1 - with dataset-specific suffix
+input_path <- file.path(get_path(config, config$paths$objects_dir),
+                        sprintf("01_seurat_annotated_%s.rds", dataset_type))
 
 if (!file.exists(input_path)) {
   stop(paste("Annotated object not found:", input_path,
-             "\nPlease run 01_cell_type_annotation.R first"))
+             sprintf("\nPlease run: Rscript scripts/01_cell_type_annotation.R --dataset %s", dataset_type)))
 }
 
 message(paste("Loading:", input_path))
@@ -220,52 +239,92 @@ message("\nSubtype distribution:")
 print(table(seurat_obj$module_score_subtype))
 
 # ==============================================================================
-# FILTER TO EPITHELIAL CELLS
+# FILTER TO EPITHELIAL CELLS (if needed)
 # ==============================================================================
 
 message("\n========================================")
-message("Filtering to Epithelial Cells")
+message("Preparing Epithelial Cells")
 message("========================================\n")
 
-# Remove unassigned and non-epithelial cells for trajectory
-exclude_subtypes <- c("Unassigned", "Non-epithelial", "Unknown")
-epithelial_mask <- !seurat_obj$module_score_subtype %in% exclude_subtypes &
-  !is.na(seurat_obj$module_score_subtype)
+# Check if we have is_epithelial_cell column
+if ("is_epithelial_cell" %in% colnames(seurat_obj@meta.data)) {
+  n_epi <- sum(seurat_obj$is_epithelial_cell, na.rm = TRUE)
+  message(sprintf("Found %d epithelial cells (of %d total)", n_epi, ncol(seurat_obj)))
 
-n_epithelial <- sum(epithelial_mask)
-message(sprintf("Epithelial cells for trajectory: %d (%.1f%%)",
-                n_epithelial, n_epithelial / ncol(seurat_obj) * 100))
-
-if (n_epithelial < 100) {
-  stop("Insufficient epithelial cells for trajectory analysis (< 100)")
+  # If object contains non-epithelial cells, filter
+  if (n_epi < ncol(seurat_obj)) {
+    message("Filtering to epithelial cells only...")
+    seurat_epi <- subset(seurat_obj, is_epithelial_cell == TRUE)
+  } else {
+    seurat_epi <- seurat_obj
+  }
+} else {
+  # Assume all cells are epithelial (from step 1 filtering)
+  message("No is_epithelial_cell column - assuming all cells are epithelial")
+  seurat_epi <- seurat_obj
 }
 
-seurat_epi <- subset(seurat_obj, cells = colnames(seurat_obj)[epithelial_mask])
-
-message("\nFiltered subtype distribution:")
-print(table(seurat_epi$module_score_subtype))
+message(sprintf("Proceeding with %d epithelial cells", ncol(seurat_epi)))
 
 # ==============================================================================
-# CHECK/CREATE DIMENSIONALITY REDUCTION
+# PREPARE DIMENSIONALITY REDUCTION
 # ==============================================================================
 
 message("\n========================================")
 message("Checking Dimensionality Reduction")
 message("========================================\n")
 
-# Check for existing reductions
 available_reductions <- names(seurat_epi@reductions)
 message(sprintf("Available reductions: %s",
                 ifelse(length(available_reductions) > 0,
                        paste(available_reductions, collapse = ", "),
                        "none")))
 
+# Check if dataset is very large - if so, run preprocessing in serial mode
+n_cells <- ncol(seurat_epi)
+n_genes <- nrow(seurat_epi)
+object_size_gb <- as.numeric(object.size(seurat_epi)) / 1024^3
+is_large_dataset <- n_cells > 50000 || object_size_gb > 2
+
+if (is_large_dataset) {
+  message(sprintf("\nLarge dataset detected (%d cells, %.1f GB)", n_cells, object_size_gb))
+  message("Running preprocessing in serial mode to avoid memory issues...")
+  # Temporarily disable parallel processing for preprocessing
+  if (requireNamespace("future", quietly = TRUE)) {
+    old_plan <- future::plan()
+    future::plan("sequential")
+  }
+}
+
 # Run PCA if not present
 if (!"pca" %in% tolower(available_reductions)) {
   message("\nRunning PCA...")
-  seurat_epi <- NormalizeData(seurat_epi, verbose = FALSE)
+
+  # Check if data needs normalization
+  needs_normalization <- tryCatch({
+    available_layers <- Layers(seurat_epi[["RNA"]])
+    if (!"data" %in% available_layers) {
+      TRUE
+    } else {
+      # Check if data layer is same as counts (not normalized)
+      counts_sample <- LayerData(seurat_epi, layer = "counts")[1:min(10, nrow(seurat_epi)), 1:min(10, ncol(seurat_epi))]
+      data_sample <- LayerData(seurat_epi, layer = "data")[1:min(10, nrow(seurat_epi)), 1:min(10, ncol(seurat_epi))]
+      all(counts_sample == data_sample)
+    }
+  }, error = function(e) TRUE)
+
+  if (needs_normalization) {
+    message("  Normalizing data...")
+    seurat_epi <- NormalizeData(seurat_epi, verbose = FALSE)
+  }
+
+  message("  Finding variable features...")
   seurat_epi <- FindVariableFeatures(seurat_epi, verbose = FALSE)
+
+  message("  Scaling data...")
   seurat_epi <- ScaleData(seurat_epi, verbose = FALSE)
+
+  message("  Running PCA...")
   seurat_epi <- RunPCA(seurat_epi, npcs = 50, verbose = FALSE)
   message("  PCA complete")
 }
@@ -275,6 +334,12 @@ if (!"umap" %in% tolower(available_reductions)) {
   message("\nRunning UMAP...")
   seurat_epi <- RunUMAP(seurat_epi, dims = 1:30, verbose = FALSE)
   message("  UMAP complete")
+}
+
+# Restore parallel plan if we changed it
+if (is_large_dataset && requireNamespace("future", quietly = TRUE)) {
+  future::plan(old_plan)
+  message("Restored parallel processing for trajectory analysis")
 }
 
 # ==============================================================================
@@ -309,146 +374,212 @@ pooled_results <- run_multi_method_trajectory(
 seurat_epi <- pooled_results$seurat_obj
 
 message("\nPooled analysis complete!")
-message(sprintf("  Methods used: %s", paste(pooled_results$methods_used, collapse = ", ")))
 
-# Report method quality scores
-if (!is.null(pooled_results$method_quality)) {
-  message("\nPer-method quality scores:")
-  for (method in names(pooled_results$method_quality)) {
-    mq <- pooled_results$method_quality[[method]]
-    message(sprintf("  %s: %.3f", method, mq$overall_quality))
+# ==============================================================================
+# PER-SAMPLE ANALYSIS
+# ==============================================================================
+
+message("\n========================================")
+message("Per-Sample Trajectory Analysis")
+message("========================================\n")
+
+# Skip per-sample analysis for cellxgene reference dataset
+per_sample_results <- NULL
+if (dataset_type == "cellxgene") {
+  message("Skipping per-sample analysis for CELLxGENE reference dataset")
+} else {
+  # Find sample column
+  sample_columns <- c("sample", "Sample", "sample_id", "Sample_ID", "orig.ident",
+                      "patient", "Patient", "donor", "Donor")
+  sample_col <- NULL
+  for (col in sample_columns) {
+    if (col %in% colnames(seurat_epi@meta.data)) {
+      sample_col <- col
+      break
+    }
+  }
+
+  if (!is.null(sample_col)) {
+    n_samples <- length(unique(seurat_epi@meta.data[[sample_col]]))
+    message(sprintf("Found sample column: %s (%d samples)", sample_col, n_samples))
+
+    if (n_samples >= 2) {
+      per_sample_results <- tryCatch({
+        run_per_sample_multi_trajectory(
+          seurat_epi,
+          config = config,
+          methods = trajectory_methods,
+          sample_column = sample_col,
+          subtype_column = "module_score_subtype",
+          parallel = (n_cores > 1)
+        )
+      }, error = function(e) {
+        warning(sprintf("Per-sample analysis failed: %s", e$message))
+        NULL
+      })
+    } else {
+      message("Only 1 sample - skipping per-sample analysis")
+    }
+  } else {
+    message("No sample column found - skipping per-sample analysis")
   }
 }
 
 # ==============================================================================
-# VALIDATE AGAINST EXPECTED ORDER
+# VALIDATE TRAJECTORY
 # ==============================================================================
 
 message("\n========================================")
-message("Validating Trajectory Order")
+message("Validating Trajectory")
 message("========================================\n")
 
-expected_order <- c("Basal-like", "Transit-Amplifying", "Intermediate", "Specialized")
+# Get expected order from config
+expected_order <- NULL
 if (!is.null(config$trajectory$expected_order)) {
   expected_order <- config$trajectory$expected_order
 }
 
-validation_pooled <- validate_trajectory_order(pooled_results, expected_order)
-print(validation_pooled)
-
-# ==============================================================================
-# PERMUTATION TEST FOR TRAJECTORY SIGNIFICANCE
-# ==============================================================================
-
-permutation_results <- NULL
-
-if (!skip_permutation) {
-  message("\n========================================")
-  message("Permutation Test for Trajectory Significance")
-  message("========================================\n")
-
-  permutation_results <- permutation_test_trajectory(
+# Validate pooled trajectory
+validation_pooled <- tryCatch({
+  validate_trajectory_order(
     seurat_epi,
-    subtype_column = "module_score_subtype",
-    expected_order = expected_order,
-    n_permutations = n_permutations,
-    parallel = n_cores > 1
+    pooled_results,
+    expected_order = expected_order
   )
+}, error = function(e) {
+  message(sprintf("  Validation warning: %s", e$message))
+  NULL
+})
 
-  message(sprintf("\nTrajectory significance: %s", permutation_results$interpretation))
-
-  # Also test method concordance if multiple methods
-  if (length(pooled_results$methods_used) > 1) {
-    method_concordance_perm <- permutation_test_method_concordance(
-      pooled_results$pseudotime_matrix,
-      n_permutations = n_permutations,
-      parallel = n_cores > 1
+# Validate per-sample if available
+validation_per_sample <- NULL
+if (!is.null(per_sample_results)) {
+  validation_per_sample <- tryCatch({
+    validate_trajectory_order(
+      seurat_epi,
+      per_sample_results,
+      expected_order = expected_order,
+      per_sample = TRUE
     )
-
-    pooled_results$method_concordance_permutation <- method_concordance_perm
-    message(sprintf("\nMethod concordance: %s (p=%.4f)",
-                    ifelse(method_concordance_perm$significant, "Significant", "Not significant"),
-                    method_concordance_perm$p_value))
-  }
+  }, error = function(e) {
+    message(sprintf("  Per-sample validation warning: %s", e$message))
+    NULL
+  })
 }
 
 # ==============================================================================
-# PER-SAMPLE ANALYSIS (PARALLELIZED)
-# ==============================================================================
-
-per_sample_enabled <- TRUE
-if (!is.null(config$trajectory$per_sample$enabled)) {
-  per_sample_enabled <- config$trajectory$per_sample$enabled
-}
-
-per_sample_results <- NULL
-
-if (per_sample_enabled && "sample" %in% colnames(seurat_epi@meta.data)) {
-
-  message("\n========================================")
-  message("Running Per-Sample Analysis (Parallelized)")
-  message("========================================\n")
-
-  per_sample_results <- run_per_sample_multi_trajectory(
-    seurat_epi,
-    config = config,
-    methods = trajectory_methods,
-    sample_column = "sample",
-    subtype_column = "module_score_subtype",
-    parallel = n_cores > 1
-  )
-
-  # Validate per-sample
-  validation_per_sample <- validate_trajectory_order(per_sample_results, expected_order)
-
-  message("\nPer-sample validation:")
-  print(validation_per_sample)
-
-  # Get heterogeneity statistics
-  heterogeneity <- attr(per_sample_results, "heterogeneity")
-  if (!is.null(heterogeneity)) {
-    message("\nSample heterogeneity summary:")
-    message(sprintf("  Heterogeneous: %s",
-                    ifelse(heterogeneity$summary$is_heterogeneous, "YES", "NO")))
-    if (length(heterogeneity$summary$reasons) > 0) {
-      for (reason in heterogeneity$summary$reasons) {
-        message(sprintf("    - %s", reason))
-      }
-    }
-  }
-
-} else {
-  message("\nSkipping per-sample analysis (disabled or no sample column)")
-}
-
-# ==============================================================================
-# COMPREHENSIVE STATISTICAL EVALUATION
+# COMPREHENSIVE STATISTICS
 # ==============================================================================
 
 message("\n========================================")
-message("Comprehensive Statistical Evaluation")
+message("Computing Trajectory Statistics")
 message("========================================\n")
 
-# Define differentiation markers for validation
-diff_markers <- list(
-  early = c("SOX9", "KRT5", "KRT14", "TP63", "ITGA6", "ITGB1", "MKI67", "TOP2A"),
-  late = c("KRT20", "MUC2", "FABP1", "SI", "ALPI", "VIL1", "TFF3", "PIGR")
-)
-
-# Run comprehensive evaluation
 trajectory_stats <- evaluate_trajectory_statistics(
-  seurat_obj = seurat_epi,
-  results = pooled_results,
+  seurat_epi,
+  pooled_results,
   config = config,
-  differentiation_markers = diff_markers,
-  expected_order = expected_order,
   run_permutation = !skip_permutation,
   n_permutations = n_permutations
 )
 
-# Add permutation results if run separately
-if (!is.null(permutation_results)) {
-  trajectory_stats$permutation_test <- permutation_results
+# Run permutation test separately if requested
+permutation_results <- NULL
+if (!skip_permutation) {
+  message("\nRunning permutation test...")
+  permutation_results <- trajectory_stats$permutation_test
+}
+
+# ==============================================================================
+# CELLXGENE-SPECIFIC ANALYSIS: Compare module_score_subtype vs cell_type
+# ==============================================================================
+
+cellxgene_comparison <- NULL
+if (dataset_type == "cellxgene" && "cell_type" %in% colnames(seurat_epi@meta.data)) {
+  message("\n========================================")
+  message("CELLxGENE-Specific Analysis")
+  message("========================================\n")
+
+  message("Comparing pseudotime across classification schemes:")
+  message("  1. module_score_subtype (our classification)")
+  message("  2. cell_type (original CELLxGENE annotation)")
+
+  # Pseudotime summary by module_score_subtype
+  message("\n--- Pseudotime by Module Score Subtype ---")
+  pt_by_subtype <- seurat_epi@meta.data %>%
+    group_by(module_score_subtype) %>%
+    summarise(
+      n_cells = n(),
+      pct_total = n() / nrow(seurat_epi@meta.data) * 100,
+      mean_pseudotime = mean(pseudotime_consensus, na.rm = TRUE),
+      sd_pseudotime = sd(pseudotime_consensus, na.rm = TRUE),
+      median_pseudotime = median(pseudotime_consensus, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(mean_pseudotime)
+
+  print(pt_by_subtype)
+
+  # Pseudotime summary by original cell_type
+  message("\n--- Pseudotime by Original Cell Type ---")
+  pt_by_celltype <- seurat_epi@meta.data %>%
+    group_by(cell_type) %>%
+    summarise(
+      n_cells = n(),
+      pct_total = n() / nrow(seurat_epi@meta.data) * 100,
+      mean_pseudotime = mean(pseudotime_consensus, na.rm = TRUE),
+      sd_pseudotime = sd(pseudotime_consensus, na.rm = TRUE),
+      median_pseudotime = median(pseudotime_consensus, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(mean_pseudotime)
+
+  print(pt_by_celltype)
+
+  # Cross-tabulation of classifications
+  message("\n--- Cross-tabulation: Module Score Subtype vs Cell Type ---")
+  cross_tab <- table(
+    ModuleScore = seurat_epi$module_score_subtype,
+    CellType = seurat_epi$cell_type
+  )
+  print(cross_tab)
+
+  # Proportions within each cell_type
+  message("\n--- Module Score Subtype proportions within each Cell Type ---")
+  cross_prop <- prop.table(cross_tab, margin = 2) * 100
+  print(round(cross_prop, 1))
+
+  # Statistical test for association
+  chi_test <- tryCatch({
+    chisq.test(cross_tab)
+  }, warning = function(w) {
+    chisq.test(cross_tab, simulate.p.value = TRUE, B = 10000)
+  }, error = function(e) NULL)
+
+  if (!is.null(chi_test)) {
+    message(sprintf("\nChi-square test (module_score_subtype × cell_type): X² = %.2f, p = %.2e",
+                    chi_test$statistic, chi_test$p.value))
+  }
+
+  # Kruskal-Wallis test for pseudotime differences by cell_type
+  kw_celltype <- tryCatch({
+    kruskal.test(pseudotime_consensus ~ cell_type, data = seurat_epi@meta.data)
+  }, error = function(e) NULL)
+
+  if (!is.null(kw_celltype)) {
+    message(sprintf("Kruskal-Wallis (pseudotime ~ cell_type): H = %.2f, p = %.2e",
+                    kw_celltype$statistic, kw_celltype$p.value))
+  }
+
+  # Store results
+  cellxgene_comparison <- list(
+    pt_by_subtype = pt_by_subtype,
+    pt_by_celltype = pt_by_celltype,
+    cross_tabulation = cross_tab,
+    cross_proportions = cross_prop,
+    chi_square_test = chi_test,
+    kruskal_wallis_celltype = kw_celltype
+  )
 }
 
 # ==============================================================================
@@ -475,9 +606,9 @@ comparison_plot <- tryCatch({
 })
 
 if (!is.null(comparison_plot)) {
-  ggsave(file.path(fig_dir, "02_trajectory_method_comparison.pdf"),
+  ggsave(file.path(fig_dir, sprintf("02_trajectory_method_comparison_%s.pdf", dataset_type)),
          comparison_plot, width = 14, height = 10)
-  ggsave(file.path(fig_dir, "02_trajectory_method_comparison.png"),
+  ggsave(file.path(fig_dir, sprintf("02_trajectory_method_comparison_%s.png", dataset_type)),
          comparison_plot, width = 14, height = 10, dpi = 300)
   message("  Saved method comparison plot")
 }
@@ -525,10 +656,10 @@ for (method in pooled_results$methods_used) {
 }
 
 umap_combined <- wrap_plots(umap_plots, ncol = 2) +
-  plot_annotation(title = "Trajectory Analysis: Pseudotime on UMAP")
+  plot_annotation(title = sprintf("Trajectory Analysis: Pseudotime on UMAP (%s)", toupper(dataset_type)))
 
-ggsave(file.path(fig_dir, "02_trajectory_umap.pdf"), umap_combined, width = 12, height = 12)
-ggsave(file.path(fig_dir, "02_trajectory_umap.png"), umap_combined, width = 12, height = 12, dpi = 300)
+ggsave(file.path(fig_dir, sprintf("02_trajectory_umap_%s.pdf", dataset_type)), umap_combined, width = 12, height = 12)
+ggsave(file.path(fig_dir, sprintf("02_trajectory_umap_%s.png", dataset_type)), umap_combined, width = 12, height = 12, dpi = 300)
 message("  Saved UMAP plots")
 
 # Plot 3: Pseudotime by subtype with CI
@@ -560,8 +691,8 @@ pt_violin <- ggplot(pt_data,
        x = "Subtype (ordered by mean pseudotime)",
        y = "Pseudotime")
 
-ggsave(file.path(fig_dir, "02_trajectory_pseudotime_violin.pdf"), pt_violin, width = 10, height = 6)
-ggsave(file.path(fig_dir, "02_trajectory_pseudotime_violin.png"), pt_violin, width = 10, height = 6, dpi = 300)
+ggsave(file.path(fig_dir, sprintf("02_trajectory_pseudotime_violin_%s.pdf", dataset_type)), pt_violin, width = 10, height = 6)
+ggsave(file.path(fig_dir, sprintf("02_trajectory_pseudotime_violin_%s.png", dataset_type)), pt_violin, width = 10, height = 6, dpi = 300)
 message("  Saved pseudotime violin plot")
 
 # Plot 4: Per-sample concordance (if available)
@@ -584,9 +715,9 @@ if (!is.null(per_sample_results)) {
                            concordance$mean_correlation),
            x = "Sample", y = "Subtype", fill = "Rank")
 
-    ggsave(file.path(fig_dir, "02_trajectory_sample_concordance.pdf"),
+    ggsave(file.path(fig_dir, sprintf("02_trajectory_sample_concordance_%s.pdf", dataset_type)),
            concordance_plot, width = 10, height = 8)
-    ggsave(file.path(fig_dir, "02_trajectory_sample_concordance.png"),
+    ggsave(file.path(fig_dir, sprintf("02_trajectory_sample_concordance_%s.png", dataset_type)),
            concordance_plot, width = 10, height = 8, dpi = 300)
     message("  Saved concordance plot")
   }
@@ -616,8 +747,8 @@ if (!is.null(permutation_results)) {
          x = "Correlation with Expected Order",
          y = "Permutation Count")
 
-  ggsave(file.path(fig_dir, "02_trajectory_permutation_test.pdf"), perm_plot, width = 10, height = 6)
-  ggsave(file.path(fig_dir, "02_trajectory_permutation_test.png"), perm_plot, width = 10, height = 6, dpi = 300)
+  ggsave(file.path(fig_dir, sprintf("02_trajectory_permutation_test_%s.pdf", dataset_type)), perm_plot, width = 10, height = 6)
+  ggsave(file.path(fig_dir, sprintf("02_trajectory_permutation_test_%s.png", dataset_type)), perm_plot, width = 10, height = 6, dpi = 300)
   message("  Saved permutation test plot")
 }
 
@@ -634,7 +765,7 @@ if (cc_col %in% colnames(seurat_epi@meta.data)) {
   })
 
   if (!is.null(cc_trajectory_plot)) {
-    cc_plot_path <- file.path(fig_dir, "02_cell_cycle_trajectory")
+    cc_plot_path <- file.path(fig_dir, sprintf("02_cell_cycle_trajectory_%s", dataset_type))
     ggsave(paste0(cc_plot_path, ".pdf"), cc_trajectory_plot, width = 14, height = 10)
     ggsave(paste0(cc_plot_path, ".png"), cc_trajectory_plot, width = 14, height = 10, dpi = 300)
     message("  Saved cell cycle trajectory plot")
@@ -662,9 +793,93 @@ if (!is.null(pooled_results$method_quality) && length(pooled_results$method_qual
          x = "Method", y = "Score", fill = "Component") +
     ylim(0, 1)
 
-  ggsave(file.path(fig_dir, "02_method_quality_comparison.pdf"), quality_plot, width = 10, height = 6)
-  ggsave(file.path(fig_dir, "02_method_quality_comparison.png"), quality_plot, width = 10, height = 6, dpi = 300)
+  ggsave(file.path(fig_dir, sprintf("02_method_quality_comparison_%s.pdf", dataset_type)), quality_plot, width = 10, height = 6)
+  ggsave(file.path(fig_dir, sprintf("02_method_quality_comparison_%s.png", dataset_type)), quality_plot, width = 10, height = 6, dpi = 300)
   message("  Saved method quality plot")
+}
+
+# ==============================================================================
+# CELLXGENE-SPECIFIC PLOTS
+# ==============================================================================
+
+if (dataset_type == "cellxgene" && !is.null(cellxgene_comparison)) {
+  message("\nCreating CELLxGENE-specific comparison plots...")
+
+  # Plot A: Pseudotime by cell_type (violin)
+  celltype_violin <- ggplot(seurat_epi@meta.data,
+                            aes(x = reorder(cell_type, pseudotime_consensus),
+                                y = pseudotime_consensus, fill = cell_type)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.2, fill = "white", outlier.size = 0.5) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    labs(title = "Pseudotime by Original Cell Type (CELLxGENE)",
+         x = "Cell Type (ordered by mean pseudotime)",
+         y = "Consensus Pseudotime")
+
+  # Plot B: Side-by-side comparison of classifications
+  subtype_violin <- ggplot(seurat_epi@meta.data,
+                           aes(x = reorder(module_score_subtype, pseudotime_consensus),
+                               y = pseudotime_consensus, fill = module_score_subtype)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.2, fill = "white", outlier.size = 0.5) +
+    scale_fill_manual(values = colors) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    labs(title = "Pseudotime by Module Score Subtype",
+         x = "Subtype (ordered by mean pseudotime)",
+         y = "Consensus Pseudotime")
+
+  # Plot C: UMAP colored by cell_type
+  umap_celltype <- DimPlot(seurat_epi, group.by = "cell_type", pt.size = 0.3) +
+    labs(title = "Original Cell Type (CELLxGENE)")
+
+  # Plot D: Confusion-style heatmap
+  cross_df <- as.data.frame(as.table(cellxgene_comparison$cross_proportions))
+  colnames(cross_df) <- c("ModuleScore", "CellType", "Percentage")
+
+  heatmap_comparison <- ggplot(cross_df, aes(x = CellType, y = ModuleScore, fill = Percentage)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.1f", Percentage)), size = 3) +
+    scale_fill_gradient2(low = "white", mid = "lightblue", high = "darkblue",
+                         midpoint = 50, name = "% of\nCell Type") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid = element_blank()) +
+    labs(title = "Module Score Classification within Each Cell Type",
+         x = "Original Cell Type", y = "Module Score Subtype")
+
+  # Combine cellxgene comparison plots
+  cellxgene_combined <- (subtype_violin | celltype_violin) /
+    (umap_plots$subtype | umap_celltype) /
+    heatmap_comparison +
+    plot_annotation(
+      title = "CELLxGENE Reference: Classification Comparison",
+      subtitle = sprintf("n = %d cells | Comparing module score classification vs original cell_type annotation",
+                         ncol(seurat_epi)),
+      tag_levels = "A"
+    )
+
+  ggsave(file.path(fig_dir, sprintf("02_cellxgene_classification_comparison_%s.pdf", dataset_type)),
+         cellxgene_combined, width = 14, height = 16)
+  ggsave(file.path(fig_dir, sprintf("02_cellxgene_classification_comparison_%s.png", dataset_type)),
+         cellxgene_combined, width = 14, height = 16, dpi = 300)
+  message("  Saved CELLxGENE classification comparison plot")
+
+  # Additional: Pseudotime density by cell_type
+  density_celltype <- ggplot(seurat_epi@meta.data, aes(x = pseudotime_consensus, fill = cell_type)) +
+    geom_density(alpha = 0.5) +
+    theme_minimal() +
+    labs(title = "Pseudotime Distribution by Original Cell Type",
+         x = "Consensus Pseudotime", y = "Density", fill = "Cell Type")
+
+  ggsave(file.path(fig_dir, sprintf("02_cellxgene_pseudotime_density_%s.pdf", dataset_type)),
+         density_celltype, width = 10, height = 6)
+  ggsave(file.path(fig_dir, sprintf("02_cellxgene_pseudotime_density_%s.png", dataset_type)),
+         density_celltype, width = 10, height = 6, dpi = 300)
+  message("  Saved CELLxGENE pseudotime density plot")
 }
 
 # ==============================================================================
@@ -685,13 +900,15 @@ trajectory_output <- list(
   pooled = pooled_results,
   per_sample = per_sample_results,
   validation_pooled = validation_pooled,
-  validation_per_sample = if (!is.null(per_sample_results)) validation_per_sample else NULL,
+  validation_per_sample = validation_per_sample,
   methods_used = pooled_results$methods_used,
   method_correlations = pooled_results$method_correlations,
   method_quality = pooled_results$method_quality,
   permutation_test = permutation_results,
   statistics = trajectory_stats,
+  cellxgene_comparison = cellxgene_comparison,  # NULL for non-cellxgene datasets
   config_used = list(
+    dataset_type = dataset_type,
     n_cores = n_cores,
     n_bootstrap = n_bootstrap,
     n_permutations = n_permutations,
@@ -699,14 +916,14 @@ trajectory_output <- list(
   )
 )
 
-saveRDS(trajectory_output, file.path(objects_dir, "02_trajectory_results.rds"))
+saveRDS(trajectory_output, file.path(objects_dir, sprintf("02_trajectory_results_%s.rds", dataset_type)))
 message(sprintf("Saved trajectory results: %s",
-                file.path(objects_dir, "02_trajectory_results.rds")))
+                file.path(objects_dir, sprintf("02_trajectory_results_%s.rds", dataset_type))))
 
 # Save updated seurat object with pseudotime
-saveRDS(seurat_epi, file.path(objects_dir, "02_seurat_with_pseudotime.rds"))
+saveRDS(seurat_epi, file.path(objects_dir, sprintf("02_seurat_with_pseudotime_%s.rds", dataset_type)))
 message(sprintf("Saved Seurat object: %s",
-                file.path(objects_dir, "02_seurat_with_pseudotime.rds")))
+                file.path(objects_dir, sprintf("02_seurat_with_pseudotime_%s.rds", dataset_type))))
 
 # Save pseudotime summary table
 pt_summary <- seurat_epi@meta.data %>%
@@ -721,27 +938,29 @@ pt_summary <- seurat_epi@meta.data %>%
   ) %>%
   arrange(mean_pseudotime)
 
-write.csv(pt_summary, file.path(tables_dir, "02_pseudotime_summary.csv"), row.names = FALSE)
+write.csv(pt_summary, file.path(tables_dir, sprintf("02_pseudotime_summary_%s.csv", dataset_type)), row.names = FALSE)
 message(sprintf("Saved pseudotime summary: %s",
-                file.path(tables_dir, "02_pseudotime_summary.csv")))
+                file.path(tables_dir, sprintf("02_pseudotime_summary_%s.csv", dataset_type))))
 
 # Save validation results
-write.csv(validation_pooled, file.path(tables_dir, "02_trajectory_validation_pooled.csv"), row.names = FALSE)
-message(sprintf("Saved validation results: %s",
-                file.path(tables_dir, "02_trajectory_validation_pooled.csv")))
+if (!is.null(validation_pooled)) {
+  write.csv(validation_pooled, file.path(tables_dir, sprintf("02_trajectory_validation_pooled_%s.csv", dataset_type)), row.names = FALSE)
+  message(sprintf("Saved validation results: %s",
+                  file.path(tables_dir, sprintf("02_trajectory_validation_pooled_%s.csv", dataset_type))))
+}
 
-if (!is.null(per_sample_results)) {
-  write.csv(validation_per_sample, file.path(tables_dir, "02_trajectory_validation_per_sample.csv"), row.names = FALSE)
+if (!is.null(validation_per_sample)) {
+  write.csv(validation_per_sample, file.path(tables_dir, sprintf("02_trajectory_validation_per_sample_%s.csv", dataset_type)), row.names = FALSE)
   message(sprintf("Saved per-sample validation: %s",
-                  file.path(tables_dir, "02_trajectory_validation_per_sample.csv")))
+                  file.path(tables_dir, sprintf("02_trajectory_validation_per_sample_%s.csv", dataset_type))))
 }
 
 # Save method correlations
 if (!is.null(pooled_results$method_correlations)) {
   write.csv(as.data.frame(pooled_results$method_correlations),
-            file.path(tables_dir, "02_method_correlations.csv"))
+            file.path(tables_dir, sprintf("02_method_correlations_%s.csv", dataset_type)))
   message(sprintf("Saved method correlations: %s",
-                  file.path(tables_dir, "02_method_correlations.csv")))
+                  file.path(tables_dir, sprintf("02_method_correlations_%s.csv", dataset_type))))
 }
 
 # Save method quality scores
@@ -755,9 +974,9 @@ if (!is.null(pooled_results$method_quality)) {
       continuity = ifelse(is.null(mq$continuity), NA, mq$continuity)
     )
   }))
-  write.csv(quality_summary, file.path(tables_dir, "02_method_quality_scores.csv"), row.names = FALSE)
+  write.csv(quality_summary, file.path(tables_dir, sprintf("02_method_quality_scores_%s.csv", dataset_type)), row.names = FALSE)
   message(sprintf("Saved method quality scores: %s",
-                  file.path(tables_dir, "02_method_quality_scores.csv")))
+                  file.path(tables_dir, sprintf("02_method_quality_scores_%s.csv", dataset_type))))
 }
 
 # Save permutation test results
@@ -771,9 +990,9 @@ if (!is.null(permutation_results)) {
     significant = permutation_results$significant,
     interpretation = permutation_results$interpretation
   )
-  write.csv(perm_summary, file.path(tables_dir, "02_permutation_test_results.csv"), row.names = FALSE)
+  write.csv(perm_summary, file.path(tables_dir, sprintf("02_permutation_test_results_%s.csv", dataset_type)), row.names = FALSE)
   message(sprintf("Saved permutation test results: %s",
-                  file.path(tables_dir, "02_permutation_test_results.csv")))
+                  file.path(tables_dir, sprintf("02_permutation_test_results_%s.csv", dataset_type))))
 }
 
 # Save bootstrap summary (if available)
@@ -786,32 +1005,86 @@ if (!is.null(pooled_results$bootstrap)) {
     ci_width = pooled_results$bootstrap$ci_width,
     boot_se = pooled_results$bootstrap$boot_se
   )
-  write.csv(boot_summary, file.path(tables_dir, "02_bootstrap_confidence_intervals.csv"), row.names = FALSE)
+  write.csv(boot_summary, file.path(tables_dir, sprintf("02_bootstrap_confidence_intervals_%s.csv", dataset_type)), row.names = FALSE)
   message(sprintf("Saved bootstrap CIs: %s",
-                  file.path(tables_dir, "02_bootstrap_confidence_intervals.csv")))
+                  file.path(tables_dir, sprintf("02_bootstrap_confidence_intervals_%s.csv", dataset_type))))
 }
 
 # Save marker validation
 if (!is.null(trajectory_stats$marker_validation)) {
   write.csv(trajectory_stats$marker_validation,
-            file.path(tables_dir, "02_marker_validation.csv"), row.names = FALSE)
+            file.path(tables_dir, sprintf("02_marker_validation_%s.csv", dataset_type)), row.names = FALSE)
   message(sprintf("Saved marker validation: %s",
-                  file.path(tables_dir, "02_marker_validation.csv")))
+                  file.path(tables_dir, sprintf("02_marker_validation_%s.csv", dataset_type))))
 }
 
 # Save heterogeneity statistics (if available)
 if (!is.null(per_sample_results)) {
   heterogeneity <- attr(per_sample_results, "heterogeneity")
   if (!is.null(heterogeneity)) {
-    saveRDS(heterogeneity, file.path(objects_dir, "02_sample_heterogeneity.rds"))
+    saveRDS(heterogeneity, file.path(objects_dir, sprintf("02_sample_heterogeneity_%s.rds", dataset_type)))
     message(sprintf("Saved heterogeneity statistics: %s",
-                    file.path(objects_dir, "02_sample_heterogeneity.rds")))
+                    file.path(objects_dir, sprintf("02_sample_heterogeneity_%s.rds", dataset_type))))
   }
 }
 
 # Generate and save markdown report
-report_path <- file.path(tables_dir, "02_trajectory_evaluation_report.md")
+report_path <- file.path(tables_dir, sprintf("02_trajectory_evaluation_report_%s.md", dataset_type))
 generate_trajectory_report(trajectory_stats, report_path)
+
+# ==============================================================================
+# CELLXGENE-SPECIFIC OUTPUTS
+# ==============================================================================
+
+if (dataset_type == "cellxgene" && !is.null(cellxgene_comparison)) {
+  message("\nSaving CELLxGENE-specific outputs...")
+
+  # Pseudotime by cell_type
+  write.csv(cellxgene_comparison$pt_by_celltype,
+            file.path(tables_dir, sprintf("02_pseudotime_by_celltype_%s.csv", dataset_type)),
+            row.names = FALSE)
+  message(sprintf("Saved: 02_pseudotime_by_celltype_%s.csv", dataset_type))
+
+  # Cross-tabulation (counts)
+  cross_tab_df <- as.data.frame.matrix(cellxgene_comparison$cross_tabulation)
+  cross_tab_df$module_score_subtype <- rownames(cross_tab_df)
+  cross_tab_df <- cross_tab_df[, c("module_score_subtype", setdiff(colnames(cross_tab_df), "module_score_subtype"))]
+  write.csv(cross_tab_df,
+            file.path(tables_dir, sprintf("02_classification_crosstab_%s.csv", dataset_type)),
+            row.names = FALSE)
+  message(sprintf("Saved: 02_classification_crosstab_%s.csv", dataset_type))
+
+  # Cross-tabulation (proportions within cell_type)
+  cross_prop_df <- as.data.frame.matrix(cellxgene_comparison$cross_proportions)
+  cross_prop_df$module_score_subtype <- rownames(cross_prop_df)
+  cross_prop_df <- cross_prop_df[, c("module_score_subtype", setdiff(colnames(cross_prop_df), "module_score_subtype"))]
+  write.csv(cross_prop_df,
+            file.path(tables_dir, sprintf("02_classification_proportions_%s.csv", dataset_type)),
+            row.names = FALSE)
+  message(sprintf("Saved: 02_classification_proportions_%s.csv", dataset_type))
+
+  # Statistical comparison summary
+  cellxgene_stats <- data.frame(
+    test = c("Chi-square (module_score × cell_type)",
+             "Kruskal-Wallis (pseudotime ~ cell_type)"),
+    statistic = c(
+      ifelse(!is.null(cellxgene_comparison$chi_square_test),
+             cellxgene_comparison$chi_square_test$statistic, NA),
+      ifelse(!is.null(cellxgene_comparison$kruskal_wallis_celltype),
+             cellxgene_comparison$kruskal_wallis_celltype$statistic, NA)
+    ),
+    p_value = c(
+      ifelse(!is.null(cellxgene_comparison$chi_square_test),
+             cellxgene_comparison$chi_square_test$p.value, NA),
+      ifelse(!is.null(cellxgene_comparison$kruskal_wallis_celltype),
+             cellxgene_comparison$kruskal_wallis_celltype$p.value, NA)
+    )
+  )
+  write.csv(cellxgene_stats,
+            file.path(tables_dir, sprintf("02_cellxgene_statistical_tests_%s.csv", dataset_type)),
+            row.names = FALSE)
+  message(sprintf("Saved: 02_cellxgene_statistical_tests_%s.csv", dataset_type))
+}
 
 # ==============================================================================
 # COMPLETION
@@ -821,62 +1094,35 @@ message("\n")
 message("================================================================")
 message("  Trajectory Analysis Complete!")
 message("================================================================")
+message(sprintf("  Dataset type: %s", toupper(dataset_type)))
 message(sprintf("  Finished: %s", Sys.time()))
 message(sprintf("  Epithelial cells analyzed: %d", ncol(seurat_epi)))
 message(sprintf("  Methods used: %s", paste(pooled_results$methods_used, collapse = ", ")))
-
-if (length(pooled_results$methods_used) > 1) {
-  message(sprintf("  Method correlation: %.3f", trajectory_stats$mean_correlation))
-}
-
-message(sprintf("  Validation: %s",
-                ifelse(validation_pooled$concordant[1], "CONCORDANT", "NOT CONCORDANT")))
-
-# Report quality score
 message(sprintf("  Quality score: %.2f (%s)",
                 trajectory_stats$quality_score$overall,
                 trajectory_stats$quality_score$grade))
-
-# Report permutation test
-if (!is.null(permutation_results)) {
-  message(sprintf("  Permutation test: p=%.4f (%s)",
-                  permutation_results$p_value,
-                  permutation_results$interpretation))
-}
-
-# Report cell cycle confounding
-if (!is.null(trajectory_stats$cell_cycle_correlation)) {
-  message(sprintf("  Cell cycle confounding: %s (ρ = %.3f)",
-                  trajectory_stats$cell_cycle_correlation$interpretation,
-                  trajectory_stats$cell_cycle_correlation$rho))
-}
-
-# Report bootstrap if available
-if (!is.null(pooled_results$bootstrap)) {
-  message(sprintf("  Bootstrap CI mean width: %.3f",
-                  mean(pooled_results$bootstrap$ci_width, na.rm = TRUE)))
-}
-
-# Report sample heterogeneity
 if (!is.null(per_sample_results)) {
-  heterogeneity <- attr(per_sample_results, "heterogeneity")
-  if (!is.null(heterogeneity)) {
-    message(sprintf("  Sample heterogeneity: %s",
-                    ifelse(heterogeneity$summary$is_heterogeneous, "DETECTED", "NOT DETECTED")))
+  concordance <- attr(per_sample_results, "concordance")
+  if (!is.null(concordance)) {
+    message(sprintf("  Cross-sample concordance: ρ = %.3f", concordance$mean_correlation))
   }
 }
-
+if (dataset_type == "cellxgene" && !is.null(cellxgene_comparison)) {
+  message("\n  CELLxGENE-specific analysis:")
+  message(sprintf("    Original cell_type categories: %d", length(unique(seurat_epi$cell_type))))
+  message(sprintf("    Module score subtypes: %d", length(unique(seurat_epi$module_score_subtype))))
+}
 message("\nOutputs:")
 message(sprintf("  Objects: %s", objects_dir))
-message(sprintf("  Tables: %s", tables_dir))
+message(sprintf("  Tables:  %s", tables_dir))
 message(sprintf("  Figures: %s", fig_dir))
-
-message("\nKey output files:")
-message("  - 02_trajectory_results.rds (full results)")
-message("  - 02_trajectory_evaluation_report.md (statistical report)")
-message("  - 02_permutation_test_results.csv (significance test)")
-message("  - 02_bootstrap_confidence_intervals.csv (CIs)")
-message("  - 02_method_quality_scores.csv (per-method evaluation)")
-
-message("\nNext step: Run 03_figure_generation.R (or generate_figures.R)")
+message("\nKey files:")
+message(sprintf("  - 02_seurat_with_pseudotime_%s.rds", dataset_type))
+message(sprintf("  - 02_trajectory_results_%s.rds", dataset_type))
+message(sprintf("  - 02_pseudotime_summary_%s.csv", dataset_type))
+if (dataset_type == "cellxgene") {
+  message(sprintf("  - 02_pseudotime_by_celltype_%s.csv", dataset_type))
+  message(sprintf("  - 02_classification_crosstab_%s.csv", dataset_type))
+  message(sprintf("  - 02_cellxgene_classification_comparison_%s.pdf", dataset_type))
+}
 message("================================================================\n")
