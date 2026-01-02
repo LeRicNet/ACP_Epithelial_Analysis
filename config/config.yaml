@@ -9,6 +9,12 @@ project:
   date_created: "2025-12-29"
 
 # ==============================================================================
+# EXTERNAL DATA
+# ==============================================================================
+external:
+  cellxgene_oral_atlas: "https://datasets.cellxgene.cziscience.com/a213eb84-ca2c-487e-bd43-675cdcce8704.h5ad"  # permanent version link
+
+# ==============================================================================
 # FILE PATHS
 # ==============================================================================
 
@@ -19,12 +25,14 @@ paths:
   acp_scn_annotated: "data/raw/acp_scn_annotated.rds"
   cellxgene_keratinocytes: "data/reference/cellxgene_skin_keratinocytes.rds"
   merged_dataset: "data/processed/merged_acp_gse.rds"
+  cellxgene_oral_atlas: "data/reference/cellxgene_oral_atlas.rds"
 
   # Output directories
   tables_dir: "results/tables"
   figures_main_dir: "results/figures/main"
   figures_supp_dir: "results/figures/supplementary"
   objects_dir: "results/objects"
+
 
 # ==============================================================================
 # GENE SIGNATURES
