@@ -827,14 +827,42 @@ generate_trajectory_report <- function(stats_results, output_path = NULL) {
     report <- c(report, "")
   }
 
-  # Order validation
-  if (!is.null(stats_results$order_validation)) {
+  # Order validation - 4-category model
+  if (!is.null(stats_results$validation_4cat)) {
+    ov <- stats_results$validation_4cat
+    report <- c(report, "## Trajectory Order Validation (4-Category Model)", "",
+                sprintf("- Expected: %s", ov$expected_order[1]),
+                sprintf("- Observed: %s", ov$observed_order[1]),
+                sprintf("- Rank correlation: rho = %.3f", ov$spearman_rho[1]),
+                sprintf("- Order preserved: **%s**", ifelse(ov$concordant[1], "YES", "NO")), "")
+  } else if (!is.null(stats_results$order_validation)) {
+    # Fallback to old format
     ov <- stats_results$order_validation
     report <- c(report, "## Trajectory Order Validation", "",
-                sprintf("- Expected: %s", paste(ov$expected, collapse = " → ")),
-                sprintf("- Observed: %s", paste(ov$observed, collapse = " → ")),
-                sprintf("- Rank correlation: ρ = %.3f", ov$rank_correlation),
+                sprintf("- Expected: %s", paste(ov$expected, collapse = " -> ")),
+                sprintf("- Observed: %s", paste(ov$observed, collapse = " -> ")),
+                sprintf("- Rank correlation: rho = %.3f", ov$rank_correlation),
                 sprintf("- Order preserved: **%s**", ifelse(ov$order_preserved, "YES", "NO")), "")
+  }
+
+  # Order validation - 3-category model
+  if (!is.null(stats_results$validation_3cat)) {
+    ov <- stats_results$validation_3cat
+    report <- c(report, "## Trajectory Order Validation (3-Category Model)", "",
+                sprintf("- Expected: %s", ov$expected_order[1]),
+                sprintf("- Observed: %s", ov$observed_order[1]),
+                sprintf("- Rank correlation: rho = %.3f", ov$spearman_rho[1]),
+                sprintf("- Order preserved: **%s**", ifelse(ov$concordant[1], "YES", "NO")), "")
+  }
+
+  # Order validation - CELLxGENE cell_type model
+  if (!is.null(stats_results$validation_cellxgene)) {
+    ov <- stats_results$validation_cellxgene
+    report <- c(report, "## Trajectory Order Validation (CELLxGENE Cell Types)", "",
+                sprintf("- Expected: %s", ov$expected_order[1]),
+                sprintf("- Observed: %s", ov$observed_order[1]),
+                sprintf("- Rank correlation: rho = %.3f", ov$spearman_rho[1]),
+                sprintf("- Order preserved: **%s**", ifelse(ov$concordant[1], "YES", "NO")), "")
   }
 
   report_text <- paste(report, collapse = "\n")
@@ -846,6 +874,10 @@ generate_trajectory_report <- function(stats_results, output_path = NULL) {
 
   return(report_text)
 }
+
+# ==============================================================================
+# VISUALIZATION FUNCTIONS
+# ==============================================================================
 
 #' Plot Cell Cycle Trajectory
 #' @export
@@ -886,4 +918,177 @@ plot_cell_cycle_trajectory <- function(seurat_obj, config = NULL) {
          x = "Pseudotime", y = "Density")
 
   return(p1 / p2)
+}
+
+#' Plot Multi-Method Trajectory Comparison
+#'
+#' Creates diagnostic plots comparing trajectory methods
+#'
+#' @param results Results from run_multi_method_trajectory
+#' @param config Configuration list (optional)
+#' @return Combined ggplot object with comparison panels
+#' @export
+plot_trajectory_comparison <- function(results, config = NULL) {
+
+  require(ggplot2)
+  require(patchwork)
+
+  plots <- list()
+
+  # Get colors from config
+  if (!is.null(config) && !is.null(config$visualization$colors$epithelial_subtypes)) {
+    colors <- unlist(config$visualization$colors$epithelial_subtypes)
+  } else {
+    colors <- NULL
+  }
+
+  seurat_obj <- results$seurat_obj
+  methods_used <- results$methods_used
+
+  # ---------------------------------------------------------------------------
+  # Plot 1: Consensus pseudotime by subtype (violin)
+  # ---------------------------------------------------------------------------
+  pt_data <- data.frame(
+    pseudotime = results$consensus$pseudotime,
+    confidence = results$consensus$confidence,
+    subtype = seurat_obj$module_score_subtype
+  )
+
+  plots$consensus_violin <- ggplot(pt_data, aes(x = reorder(subtype, pseudotime),
+                                                y = pseudotime, fill = subtype)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.2, fill = "white", outlier.size = 0.5) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    labs(title = "Consensus Pseudotime by Subtype",
+         x = "", y = "Pseudotime")
+
+  if (!is.null(colors)) {
+    plots$consensus_violin <- plots$consensus_violin +
+      scale_fill_manual(values = colors)
+  }
+
+  # ---------------------------------------------------------------------------
+  # Plot 2: Method comparison scatter (if 2+ methods)
+  # ---------------------------------------------------------------------------
+  if (length(methods_used) >= 2) {
+    pt_matrix <- results$pseudotime_matrix
+
+    method1 <- methods_used[1]
+    method2 <- methods_used[2]
+
+    compare_data <- data.frame(
+      method1 = pt_matrix[, method1],
+      method2 = pt_matrix[, method2],
+      subtype = seurat_obj$module_score_subtype
+    )
+
+    cor_val <- cor(compare_data$method1, compare_data$method2,
+                   use = "pairwise.complete.obs", method = "spearman")
+
+    plots$method_scatter <- ggplot(compare_data, aes(x = method1, y = method2, color = subtype)) +
+      geom_point(alpha = 0.5, size = 1) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+      theme_minimal() +
+      labs(title = sprintf("%s vs %s (rho = %.3f)", method1, method2, cor_val),
+           x = paste(method1, "pseudotime"),
+           y = paste(method2, "pseudotime"),
+           color = "Subtype")
+
+    if (!is.null(colors)) {
+      plots$method_scatter <- plots$method_scatter +
+        scale_color_manual(values = colors)
+    }
+  }
+
+  # ---------------------------------------------------------------------------
+  # Plot 3: Confidence distribution
+  # ---------------------------------------------------------------------------
+  plots$confidence_hist <- ggplot(pt_data, aes(x = confidence)) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.7) +
+    geom_vline(xintercept = mean(pt_data$confidence, na.rm = TRUE),
+               color = "red", linetype = "dashed", linewidth = 1) +
+    theme_minimal() +
+    labs(title = sprintf("Pseudotime Confidence (mean = %.3f)",
+                         mean(pt_data$confidence, na.rm = TRUE)),
+         x = "Confidence", y = "Count")
+
+  # ---------------------------------------------------------------------------
+  # Plot 4: Confidence by subtype
+  # ---------------------------------------------------------------------------
+  plots$confidence_subtype <- ggplot(pt_data, aes(x = reorder(subtype, -confidence),
+                                                  y = confidence, fill = subtype)) +
+    geom_boxplot() +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    labs(title = "Confidence by Subtype",
+         x = "", y = "Confidence")
+
+  if (!is.null(colors)) {
+    plots$confidence_subtype <- plots$confidence_subtype +
+      scale_fill_manual(values = colors)
+  }
+
+  # ---------------------------------------------------------------------------
+  # Plot 5: Per-method pseudotime distributions
+  # ---------------------------------------------------------------------------
+  if (length(methods_used) >= 1) {
+    method_pt_data <- data.frame(
+      cell = rep(rownames(results$pseudotime_matrix), length(methods_used)),
+      pseudotime = as.vector(results$pseudotime_matrix),
+      method = rep(methods_used, each = nrow(results$pseudotime_matrix))
+    )
+
+    plots$method_distributions <- ggplot(method_pt_data, aes(x = pseudotime, fill = method)) +
+      geom_density(alpha = 0.5) +
+      theme_minimal() +
+      labs(title = "Pseudotime Distributions by Method",
+           x = "Pseudotime (raw)", y = "Density", fill = "Method")
+  }
+
+  # ---------------------------------------------------------------------------
+  # Plot 6: Quality scores by method
+  # ---------------------------------------------------------------------------
+  if (!is.null(results$method_quality) && length(results$method_quality) > 0) {
+    quality_df <- do.call(rbind, lapply(names(results$method_quality), function(m) {
+      mq <- results$method_quality[[m]]
+      data.frame(
+        method = m,
+        overall_quality = mq$overall_quality,
+        separation = ifelse(is.null(mq$separation) || is.na(mq$separation), NA, mq$separation),
+        continuity = ifelse(is.null(mq$continuity) || is.na(mq$continuity), NA, mq$continuity)
+      )
+    }))
+
+    quality_long <- tidyr::pivot_longer(quality_df, cols = -method,
+                                        names_to = "metric", values_to = "value")
+
+    plots$quality_bars <- ggplot(quality_long, aes(x = method, y = value, fill = metric)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      scale_fill_brewer(palette = "Set2") +
+      theme_minimal() +
+      labs(title = "Method Quality Metrics",
+           x = "Method", y = "Score", fill = "Metric") +
+      ylim(0, 1)
+  }
+
+  # ---------------------------------------------------------------------------
+  # Combine plots
+  # ---------------------------------------------------------------------------
+  if (length(methods_used) >= 2) {
+    combined <- (plots$consensus_violin | plots$method_scatter) /
+      (plots$confidence_hist | plots$confidence_subtype) /
+      (plots$method_distributions | plots$quality_bars) +
+      plot_annotation(title = "Trajectory Method Comparison",
+                      tag_levels = "A")
+  } else {
+    combined <- (plots$consensus_violin | plots$confidence_hist) /
+      (plots$confidence_subtype | plots$method_distributions) +
+      plot_annotation(title = "Trajectory Analysis Overview",
+                      tag_levels = "A")
+  }
+
+  return(combined)
 }
