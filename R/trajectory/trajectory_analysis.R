@@ -258,6 +258,11 @@ run_monocle3_trajectory <- function(seurat_obj, config = NULL,
 
   library(monocle3)
 
+  # Join layers if needed (Seurat v5 compatibility)
+  if (inherits(seurat_obj[["RNA"]], "Assay5") && length(Layers(seurat_obj[["RNA"]])) > 1) {
+    seurat_obj <- JoinLayers(seurat_obj)
+  }
+
   message("  Converting to cell_data_set...")
   cds <- SeuratWrappers::as.cell_data_set(seurat_obj)
   SummarizedExperiment::colData(cds)$subtype <- seurat_obj@meta.data[[subtype_column]]
@@ -686,6 +691,11 @@ evaluate_trajectory_statistics <- function(seurat_obj,
 
   # Marker validation
   message("\n--- Marker-Pseudotime Correlations ---")
+
+  # Join layers if needed (Seurat v5 compatibility)
+  if (inherits(seurat_obj[["RNA"]], "Assay5") && length(Layers(seurat_obj[["RNA"]])) > 1) {
+    seurat_obj <- JoinLayers(seurat_obj)
+  }
 
   available_genes <- rownames(seurat_obj)
   early_markers <- intersect(differentiation_markers$early, available_genes)
