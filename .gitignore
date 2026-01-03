@@ -50,6 +50,7 @@ results/figures/**/*.png
 Thumbs.db
 
 # IDE
+*.Rproj
 .vscode/
 .idea/
 *.swp
