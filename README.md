@@ -469,6 +469,12 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file.
 
 # TODO:
 
-- add comment about
+- add comment about (for cellxgene download, non-url based)
 chmod +x scripts/setup_python.sh
 ./scripts/setup_python.sh
+
+- download cellxgene reference data
+```
+  Rscript scripts/download_cellxgene_reference.R --dataset=oral  # Oral Atlas (hard-coded and versioned url)
+  python scripts/download_cellxgene_reference.py --tissue skin --max_cells 50000  # will download latest version (may impact reproducibility)
+```

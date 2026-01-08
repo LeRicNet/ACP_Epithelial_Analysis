@@ -12,13 +12,19 @@
 #' Usage (interactive):
 #'   source("scripts/download_cellxgene_reference.R")
 #'   skin_ref <- get_cellxgene_reference()  # Query-based download
-#'   oral_ref <- get_reference_from_url()   # Direct URL download
+#'   oral_ref <- get_reference_from_url()   # Direct URL download (oral atlas)
+#'   tabula_ref <- get_reference_from_url(  # Tabula Sapiens
+#'     config_key_url = "external.cellxgene_tabula_sapiens",
+#'     config_key_path = "paths.cellxgene_tabula_sapiens"
+#'   )
 #'
 #' Configuration (config/config.yaml):
 #'   external:
 #'     cellxgene_oral_atlas: "https://datasets.cellxgene.cziscience.com/..."
+#'     cellxgene_tabula_sapiens: "https://datasets.cellxgene.cziscience.com/..."
 #'   paths:
 #'     cellxgene_oral_atlas: "data/reference/cellxgene_oral_atlas.rds"
+#'     cellxgene_tabula_sapiens: "data/reference/cellxgene_tabula_sapiens.rds"
 #' =============================================================================
 
 suppressPackageStartupMessages({
@@ -161,6 +167,41 @@ get_config <- function(key, config_path = "config/config.yaml") {
 DEFAULT_H5AD_PATH <- "data/reference/cellxgene_skin_keratinocytes.h5ad"
 DEFAULT_RDS_PATH <- "data/reference/cellxgene_skin_keratinocytes.rds"
 DEFAULT_DOWNLOAD_SCRIPT <- "python/download_cellxgene_reference.py"
+
+# =============================================================================
+# Dataset Configuration Mapping
+# =============================================================================
+
+#' Get config keys for a named dataset
+#'
+#' Maps dataset names to their config paths for URL and output file.
+#'
+#' @param dataset Dataset name: "oral", "tabula_sapiens", "tabula-sapiens"
+#' @return List with url_key and path_key
+get_dataset_config_keys <- function(dataset) {
+  dataset <- tolower(gsub("-", "_", dataset))
+
+  datasets <- list(
+    oral = list(
+      url_key = "external.cellxgene_oral_atlas",
+      path_key = "paths.cellxgene_oral_atlas",
+      description = "Oral Epithelial Atlas"
+    ),
+    tabula_sapiens = list(
+      url_key = "external.cellxgene_tabula_sapiens",
+      path_key = "paths.cellxgene_tabula_sapiens",
+      description = "Tabula Sapiens (full human atlas)"
+    )
+  )
+
+  if (!dataset %in% names(datasets)) {
+    available <- paste(names(datasets), collapse = ", ")
+    stop("Unknown dataset '", dataset, "'. Available URL-based datasets: ", available,
+         call. = FALSE)
+  }
+
+  return(datasets[[dataset]])
+}
 
 # =============================================================================
 # Conversion Function
@@ -394,9 +435,9 @@ download_h5ad_from_url <- function(url,
 #' Downloads an h5ad file from a URL and converts to Seurat object.
 #' Reads URL and output paths from config if not specified.
 #'
-#' @param url URL to h5ad file (default: from config external.cellxgene_oral_atlas)
+#' @param url URL to h5ad file (default: from config)
 #' @param h5ad_path Local path for h5ad (default: derived from rds_path)
-#' @param rds_path Path for RDS cache (default: from config paths.cellxgene_oral_atlas)
+#' @param rds_path Path for RDS cache (default: from config)
 #' @param force_download Re-download even if h5ad exists (default: FALSE)
 #' @param force_convert Re-convert even if RDS exists (default: FALSE)
 #' @param save_rds Save converted Seurat as RDS (default: TRUE)
@@ -406,9 +447,15 @@ download_h5ad_from_url <- function(url,
 #' @return Seurat object
 #'
 #' @examples
-#' \dontrun
+#' \dontrun{
 #' # Use config defaults (oral atlas)
 #' oral_ref <- get_reference_from_url()
+#'
+#' # Download Tabula Sapiens
+#' tabula_ref <- get_reference_from_url(
+#'   config_key_url = "external.cellxgene_tabula_sapiens",
+#'   config_key_path = "paths.cellxgene_tabula_sapiens"
+#' )
 #'
 #' # Specify custom URL and path
 #' custom_ref <- get_reference_from_url(
@@ -481,6 +528,46 @@ get_reference_from_url <- function(url = NULL,
   )
 
   return(seurat_obj)
+}
+
+
+#' Get reference by dataset name
+#'
+#' Convenience wrapper around get_reference_from_url that accepts a dataset name
+#' instead of config keys.
+#'
+#' @param dataset Dataset name: "oral", "tabula_sapiens", or "tabula-sapiens"
+#' @param force_download Re-download even if h5ad exists (default: FALSE)
+#' @param force_convert Re-convert even if RDS exists (default: FALSE)
+#' @param ... Additional arguments passed to get_reference_from_url
+#' @return Seurat object
+#'
+#' @examples
+#' \dontrun{
+#' # Download oral atlas
+#' oral_ref <- get_reference_by_name("oral")
+#'
+#' # Download Tabula Sapiens
+#' tabula_ref <- get_reference_by_name("tabula_sapiens")
+#' }
+get_reference_by_name <- function(dataset,
+                                  force_download = FALSE,
+                                  force_convert = FALSE,
+                                  ...) {
+
+  config_keys <- get_dataset_config_keys(dataset)
+
+  message("\n", strrep("=", 70))
+  message("Downloading: ", config_keys$description)
+  message(strrep("=", 70))
+
+  get_reference_from_url(
+    config_key_url = config_keys$url_key,
+    config_key_path = config_keys$path_key,
+    force_download = force_download,
+    force_convert = force_convert,
+    ...
+  )
 }
 
 
@@ -918,6 +1005,13 @@ if (!interactive()) {
   dataset_arg <- grep("^--dataset", args, value = TRUE)
   if (length(dataset_arg) > 0) {
     dataset <- sub("^--dataset[= ]?", "", dataset_arg)
+    # Handle --dataset=value format
+    if (dataset == "") {
+      idx <- which(args == "--dataset")
+      if (idx < length(args)) {
+        dataset <- args[idx + 1]
+      }
+    }
   } else {
     dataset <- "skin"  # Default
   }
@@ -927,41 +1021,63 @@ if (!interactive()) {
     cat("\nDownloads CELLxGENE reference data and converts to Seurat.\n")
     cat("\nOptions:\n")
     cat("  --force, -f           Re-download and re-convert even if files exist\n")
-    cat("  --dataset=NAME        Dataset to download: 'skin' (query) or 'oral' (URL)\n")
+    cat("  --dataset=NAME        Dataset to download (see below)\n")
     cat("  --use-script          Use external Python script (default: use reticulate)\n")
     cat("  --help, -h            Show this help message\n")
     cat("\nDatasets:\n")
-    cat("  skin    Query-based download of skin keratinocytes from Census\n")
-    cat("  oral    Direct URL download of oral atlas from config\n")
+    cat("  skin            Query-based download of skin keratinocytes from Census\n")
+    cat("  oral            Direct URL download of oral epithelial atlas\n")
+    cat("  tabula_sapiens  Direct URL download of Tabula Sapiens (full human atlas)\n")
+    cat("  tabula-sapiens  (alias for tabula_sapiens)\n")
+    cat("\nExamples:\n")
+    cat("  Rscript download_cellxgene_reference.R --dataset skin\n")
+    cat("  Rscript download_cellxgene_reference.R --dataset oral --force\n")
+    cat("  Rscript download_cellxgene_reference.R --dataset tabula_sapiens\n")
     cat("\nConfig paths (config/config.yaml):\n")
     cat("  external:\n")
     cat("    cellxgene_oral_atlas: <URL>\n")
+    cat("    cellxgene_tabula_sapiens: <URL>\n")
     cat("  paths:\n")
     cat("    cellxgene_keratinocytes: data/reference/cellxgene_skin_keratinocytes.rds\n")
     cat("    cellxgene_oral_atlas: data/reference/cellxgene_oral_atlas.rds\n")
+    cat("    cellxgene_tabula_sapiens: data/reference/cellxgene_tabula_sapiens.rds\n")
     quit(status = 0)
   }
+
+  # Normalize dataset name
+  dataset <- tolower(gsub("-", "_", dataset))
+
+  cat("\n")
+  cat(strrep("=", 70), "\n")
+  cat("CELLxGENE Reference Download\n")
+  cat(strrep("=", 70), "\n")
+  cat("Dataset: ", dataset, "\n")
+  cat("Force: ", force_download, "\n")
+  cat("\n")
 
   # Setup Python environment
   setup_python_env()
 
-  if (dataset == "oral") {
-    # Direct URL download
-    cat("\n")
-    cat("Downloading oral atlas from URL...\n")
-    ref <- get_reference_from_url(
-      force_download = force_download,
-      force_convert = force_download
-    )
-  } else {
+  if (dataset == "skin") {
     # Query-based download (skin)
-    cat("\n")
     cat("Downloading skin keratinocytes via Census query...\n")
     ref <- get_cellxgene_reference(
       force_download = force_download,
       force_convert = force_download,
       use_reticulate_download = !use_script
     )
+  } else if (dataset %in% c("oral", "tabula_sapiens")) {
+    # Direct URL download
+    cat("Downloading via direct URL...\n")
+    ref <- get_reference_by_name(
+      dataset = dataset,
+      force_download = force_download,
+      force_convert = force_download
+    )
+  } else {
+    cat("ERROR: Unknown dataset '", dataset, "'\n", sep = "")
+    cat("Use --help to see available datasets.\n")
+    quit(status = 1)
   }
 
   # Print summary
@@ -974,6 +1090,10 @@ if (!interactive()) {
   cat("\nExample gene names:\n")
   print(head(rownames(ref), 10))
   cat("\nCell type distribution:\n")
-  print(head(sort(table(ref$cell_type), decreasing = TRUE), 20))
+  if ("cell_type" %in% colnames(ref@meta.data)) {
+    print(head(sort(table(ref$cell_type), decreasing = TRUE), 20))
+  } else {
+    cat("(cell_type column not found in metadata)\n")
+  }
   cat("\nDone!\n")
 }

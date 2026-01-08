@@ -13,6 +13,7 @@ project:
 # ==============================================================================
 external:
   cellxgene_oral_atlas: "https://datasets.cellxgene.cziscience.com/a213eb84-ca2c-487e-bd43-675cdcce8704.h5ad"  # permanent version link
+  cellxgene_tabula_sapiens: "https://datasets.cellxgene.cziscience.com/5a495302-b7cd-4bf9-853e-95627b00bb03.h5ad"
 
 # ==============================================================================
 # FILE PATHS
@@ -26,6 +27,7 @@ paths:
   cellxgene_keratinocytes: "data/reference/cellxgene_skin_keratinocytes.rds"
   merged_dataset: "data/processed/merged_acp_gse.rds"
   cellxgene_oral_atlas: "data/reference/cellxgene_oral_atlas.rds"
+  cellxgene_tabula_sapiens: "data/reference/cellxgene_tabula_sapiens.rds"
 
   # Output directories
   tables_dir: "results/tables"

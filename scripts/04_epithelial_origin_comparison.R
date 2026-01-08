@@ -287,9 +287,12 @@ subsample_seurat <- function(obj, n_max, label) {
   return(obj)
 }
 
-acp_sub <- subsample_seurat(acp_epithelial, max_cells_per_group, "ACP")
-oral_sub <- subsample_seurat(oral_mucosal, max_cells_per_group, "Oral")
-skin_sub <- subsample_seurat(skin_epithelial, max_cells_per_group, "Skin")
+# acp_sub <- subsample_seurat(acp_epithelial, max_cells_per_group, "ACP")
+# oral_sub <- subsample_seurat(oral_mucosal, max_cells_per_group, "Oral")
+# skin_sub <- subsample_seurat(skin_epithelial, max_cells_per_group, "Skin")
+acp_sub <- acp_epithelial  # Keep all ACP cells
+oral_sub <- oral_mucosal
+skin_sub <- skin_epithelial
 
 # ==============================================================================
 # SECTION 0: BATCH EFFECT DIAGNOSTIC AND INTEGRATION
@@ -455,6 +458,209 @@ batch_results <- data.frame(
             mean_source_var - mean_source_var_post, mean_sil, positive_control_passed)
 )
 write.csv(batch_results, file.path(tables_dir, "04_batch_diagnostic.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 0.4: Reference-only PCA projection and outlier identification
+# -----------------------------------------------------------------------------
+
+message("\n--- 0.4: Reference-only PCA projection ---\n")
+
+# Build PCA on reference only (Oral + Skin)
+ref_only <- subset(merged_raw, source %in% c("Oral", "Skin"))
+ref_only <- FindVariableFeatures(ref_only, nfeatures = 2000, verbose = FALSE)
+ref_only <- ScaleData(ref_only, verbose = FALSE)
+ref_only <- RunPCA(ref_only, npcs = 30, verbose = FALSE)
+
+# Get loadings and coordinates
+ref_loadings <- Loadings(ref_only, "pca")[, 1:30]
+ref_pca <- Embeddings(ref_only, "pca")[, 1:30]
+pca_genes <- rownames(ref_loadings)
+
+message(sprintf("  Reference PCA built on %d cells", ncol(ref_only)))
+
+# Project ACP onto reference PCA space
+acp_only_proj <- subset(merged_raw, source == "ACP")
+acp_scale <- GetAssayData(acp_only_proj, layer = "scale.data")
+common_genes <- intersect(pca_genes, rownames(acp_scale))
+acp_projected <- t(as.matrix(acp_scale[common_genes, ])) %*% ref_loadings[common_genes, ]
+
+message(sprintf("  ACP cells projected: %d", nrow(acp_projected)))
+
+# Calculate reference bounds (95% envelope)
+ref_pc1_bounds <- quantile(ref_pca[, 1], c(0.025, 0.975))
+ref_pc2_bounds <- quantile(ref_pca[, 2], c(0.025, 0.975))
+
+message(sprintf("  Reference PC1 95%% bounds: [%.2f, %.2f]", ref_pc1_bounds[1], ref_pc1_bounds[2]))
+message(sprintf("  Reference PC2 95%% bounds: [%.2f, %.2f]", ref_pc2_bounds[1], ref_pc2_bounds[2]))
+
+# Identify ACP outliers (outside reference envelope)
+acp_proj_df <- data.frame(
+  cell = rownames(acp_projected),
+  PC1 = acp_projected[, 1],
+  PC2 = acp_projected[, 2]
+)
+
+acp_proj_df$is_outlier <-
+  acp_proj_df$PC1 < ref_pc1_bounds[1] | acp_proj_df$PC1 > ref_pc1_bounds[2] |
+  acp_proj_df$PC2 < ref_pc2_bounds[1] | acp_proj_df$PC2 > ref_pc2_bounds[2]
+
+acp_proj_df$outlier_type <- case_when(
+  acp_proj_df$PC2 < ref_pc2_bounds[1] ~ "PC2_low",
+  acp_proj_df$PC2 > ref_pc2_bounds[2] ~ "PC2_high",
+  acp_proj_df$PC1 < ref_pc1_bounds[1] ~ "PC1_low",
+  acp_proj_df$PC1 > ref_pc1_bounds[2] ~ "PC1_high",
+  TRUE ~ "Within_reference"
+)
+
+n_outliers <- sum(acp_proj_df$is_outlier)
+pct_outliers <- 100 * n_outliers / nrow(acp_proj_df)
+
+message(sprintf("\n  ACP outliers (outside 95%% reference): %d (%.1f%%)", n_outliers, pct_outliers))
+print(table(acp_proj_df$outlier_type))
+
+# -----------------------------------------------------------------------------
+# 0.5: DE analysis - Outliers vs Within-reference
+# -----------------------------------------------------------------------------
+
+# message("\n--- 0.5: DE analysis (Outliers vs Within-reference) ---\n")
+#
+# # Add outlier status to ACP subset
+# acp_de <- subset(merged_raw, source == "ACP")
+# acp_de$projection_outlier <- acp_proj_df$outlier_type[match(colnames(acp_de), acp_proj_df$cell)]
+# acp_de$is_outlier <- acp_proj_df$is_outlier[match(colnames(acp_de), acp_proj_df$cell)]
+#
+# Idents(acp_de) <- "is_outlier"
+#
+# if (sum(acp_de$is_outlier) >= 50 && sum(!acp_de$is_outlier) >= 50) {
+#   markers_outlier <- FindMarkers(
+#     acp_de,
+#     ident.1 = TRUE,
+#     ident.2 = FALSE,
+#     only.pos = FALSE,
+#     min.pct = 0.1,
+#     logfc.threshold = 0.25,
+#     verbose = FALSE
+#   )
+#   markers_outlier$gene <- rownames(markers_outlier)
+#
+#   n_sig <- sum(markers_outlier$p_val_adj < 0.05)
+#   n_up <- sum(markers_outlier$p_val_adj < 0.05 & markers_outlier$avg_log2FC > 0)
+#   n_down <- sum(markers_outlier$p_val_adj < 0.05 & markers_outlier$avg_log2FC < 0)
+#
+#   message(sprintf("  DE genes (outlier vs within-reference): %d significant", n_sig))
+#   message(sprintf("  Upregulated in outliers: %d", n_up))
+#   message(sprintf("  Downregulated in outliers: %d", n_down))
+#
+#   message("\nTop genes UPREGULATED in outlier ACP cells:")
+#   print(head(markers_outlier %>% filter(avg_log2FC > 0, p_val_adj < 0.05) %>%
+#                arrange(p_val_adj) %>% select(gene, avg_log2FC, pct.1, pct.2, p_val_adj), 15))
+#
+#   message("\nTop genes DOWNREGULATED in outlier ACP cells:")
+#   print(head(markers_outlier %>% filter(avg_log2FC < 0, p_val_adj < 0.05) %>%
+#                arrange(p_val_adj) %>% select(gene, avg_log2FC, pct.1, pct.2, p_val_adj), 15))
+#
+#   write.csv(markers_outlier, file.path(tables_dir, "04_outlier_de_genes.csv"), row.names = FALSE)
+# } else {
+#   message("  Insufficient cells for DE analysis")
+#   markers_outlier <- NULL
+# }
+
+# -----------------------------------------------------------------------------
+# 0.6: Gene set enrichment for outliers
+# -----------------------------------------------------------------------------
+
+# message("\n--- 0.6: Gene set enrichment (Outliers) ---\n")
+#
+# outlier_enrichment <- list()
+#
+# for (gs_name in names(keratin_signatures)) {
+#   genes <- keratin_signatures[[gs_name]]
+#   genes_present <- genes[genes %in% rownames(acp_de)]
+#
+#   if (length(genes_present) >= 3) {
+#     expr <- GetAssayData(acp_de, layer = "data")[genes_present, , drop = FALSE]
+#
+#     outlier_means <- colMeans(as.matrix(expr[, acp_de$is_outlier, drop = FALSE]))
+#     within_means <- colMeans(as.matrix(expr[, !acp_de$is_outlier, drop = FALSE]))
+#
+#     wtest <- wilcox.test(outlier_means, within_means)
+#
+#     outlier_enrichment[[gs_name]] <- data.frame(
+#       gene_set = gs_name,
+#       n_genes = length(genes_present),
+#       mean_outlier = mean(outlier_means),
+#       mean_within = mean(within_means),
+#       log2fc = log2((mean(outlier_means) + 0.01) / (mean(within_means) + 0.01)),
+#       p_value = wtest$p.value
+#     )
+#   }
+# }
+#
+# outlier_enrich_df <- do.call(rbind, outlier_enrichment)
+# outlier_enrich_df$p_adj <- p.adjust(outlier_enrich_df$p_value, method = "BH")
+# outlier_enrich_df <- outlier_enrich_df %>% arrange(p_adj)
+#
+# message("Gene set enrichment (Outliers vs Within-reference):")
+# print(outlier_enrich_df %>% mutate(across(where(is.numeric), ~round(., 4))))
+#
+# write.csv(outlier_enrich_df, file.path(tables_dir, "04_outlier_geneset_enrichment.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# Plot: PCA projection with outliers
+# -----------------------------------------------------------------------------
+
+message("\nCreating PCA projection plot...")
+
+# Combine reference and ACP for plotting
+ref_plot <- data.frame(
+  PC1 = ref_pca[, 1],
+  PC2 = ref_pca[, 2],
+  Origin = ref_only$source
+)
+
+acp_plot <- data.frame(
+  PC1 = acp_proj_df$PC1,
+  PC2 = acp_proj_df$PC2,
+  Origin = "ACP"
+)
+
+projection_plot_df <- rbind(ref_plot, acp_plot)
+
+p_projection <- ggplot(projection_plot_df, aes(x = PC1, y = PC2, color = Origin)) +
+  geom_point(alpha = 0.4, size = 0.5) +
+  stat_ellipse(level = 0.95, linewidth = 1) +
+  scale_color_manual(values = c("ACP" = "#E41A1C", "Oral" = "#4DAF4A", "Skin" = "#377EB8")) +
+  theme_minimal(base_size = 12) +
+  labs(title = "PCA Projection: ACP onto Reference Space",
+       subtitle = "ACP cells projected onto Oral+Skin reference PCA")
+
+ggsave(file.path(fig_dir, "04_pca_projection.pdf"), p_projection, width = 10, height = 8)
+ggsave(file.path(fig_dir, "04_pca_projection.png"), p_projection, width = 10, height = 8, dpi = 300)
+
+# # Plot with outliers highlighted
+# acp_proj_df$group <- ifelse(acp_proj_df$is_outlier, "Outlier", "Within_Reference")
+#
+# p_outliers <- ggplot() +
+#   geom_point(data = ref_plot, aes(x = PC1, y = PC2), color = "grey70", alpha = 0.3, size = 0.5) +
+#   geom_rect(aes(xmin = ref_pc1_bounds[1], xmax = ref_pc1_bounds[2],
+#                 ymin = ref_pc2_bounds[1], ymax = ref_pc2_bounds[2]),
+#             fill = NA, color = "grey40", linetype = "dashed", linewidth = 0.8) +
+#   geom_point(data = acp_proj_df %>% filter(!is_outlier),
+#              aes(x = PC1, y = PC2), color = "#E41A1C", alpha = 0.5, size = 0.8) +
+#   geom_point(data = acp_proj_df %>% filter(is_outlier),
+#              aes(x = PC1, y = PC2), color = "#FFD700", alpha = 0.8, size = 1) +
+#   theme_minimal(base_size = 12) +
+#   labs(title = "ACP Outliers in Reference PCA Space",
+#        subtitle = sprintf("Outliers (yellow): %d cells (%.1f%%) outside 95%% reference envelope",
+#                           n_outliers, pct_outliers),
+#        x = "PC1", y = "PC2")
+#
+# ggsave(file.path(fig_dir, "04_pca_outliers.pdf"), p_outliers, width = 10, height = 8)
+# ggsave(file.path(fig_dir, "04_pca_outliers.png"), p_outliers, width = 10, height = 8, dpi = 300)
+#
+# # Save outlier classification
+# write.csv(acp_proj_df, file.path(tables_dir, "04_acp_projection_outliers.csv"), row.names = FALSE)
+
 
 # ==============================================================================
 # ANALYSIS 1: KERATIN PROFILE COMPARISON
