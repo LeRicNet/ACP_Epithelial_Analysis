@@ -427,9 +427,31 @@ ggsave(file.path(fig_dir, "04_batch_correction_comparison.png"), p_integration,
 message("\n--- 0.3: Positive control - Oral vs Skin separation ---\n")
 
 # Subset to reference cells only
-ref_cells <- merged_integrated$source %in% c("Oral", "Skin")
-ref_harmony <- harmony_coords[ref_cells, ]
-ref_labels <- merged_integrated$source[ref_cells]
+ref_cells <- which(merged_integrated$source %in% c("Oral", "Skin"))
+ref_labels_full <- merged_integrated$source[ref_cells]
+
+# Subsample for silhouette calculation (dist() cannot handle >~20K cells)
+set.seed(config$reproducibility$seed)
+n_sample_sil <- min(10000, length(ref_cells))
+
+# Stratified sampling to maintain Oral/Skin proportions
+oral_idx <- ref_cells[ref_labels_full == "Oral"]
+skin_idx <- ref_cells[ref_labels_full == "Skin"]
+
+n_oral_sample <- round(n_sample_sil * length(oral_idx) / length(ref_cells))
+n_skin_sample <- n_sample_sil - n_oral_sample
+
+sample_idx <- c(
+
+  sample(oral_idx, min(n_oral_sample, length(oral_idx))),
+  sample(skin_idx, min(n_skin_sample, length(skin_idx)))
+)
+
+ref_harmony <- harmony_coords[sample_idx, ]
+ref_labels <- merged_integrated$source[sample_idx]
+
+message(sprintf("  Silhouette calculated on %d subsampled cells (Oral: %d, Skin: %d)",
+                length(sample_idx), sum(ref_labels == "Oral"), sum(ref_labels == "Skin")))
 
 # Silhouette score
 sil <- silhouette(as.numeric(factor(ref_labels)), dist(ref_harmony))
